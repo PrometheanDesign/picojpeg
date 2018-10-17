@@ -1,5 +1,7 @@
 //------------------------------------------------------------------------------
 // picojpeg - Public domain, Rich Geldreich <richgel99@gmail.com>
+// Oct. 16, 2018 - Made reentrant, added scanline output, added RGB565 output
+// Changes from Scott Wagner <scott.wagner@promethean-design.com>
 //------------------------------------------------------------------------------
 #ifndef PICOJPEG_H
 #define PICOJPEG_H
@@ -11,6 +13,7 @@ extern "C" {
 // Error codes
 enum
 {
+   PJPG_OK = 0,
    PJPG_NO_MORE_BLOCKS = 1,
    PJPG_BAD_DHT_COUNTS,
    PJPG_BAD_DHT_INDEX,
@@ -60,6 +63,17 @@ typedef enum
    PJPG_YH2V2
 } pjpeg_scan_type_t;
 
+// Output types
+typedef enum
+{
+   PJPG_GRAY8,
+   PJPG_RGB888,
+   PJPG_RGB565,
+   PJPG_REDUCED_GRAY8,
+   PJPG_REDUCED_RGB888,
+   PJPG_REDUCED_RGB565,
+} pjpeg_output_type_t;
+
 typedef struct
 {
    // Image resolution
@@ -79,6 +93,15 @@ typedef struct
    // MCU width/height in pixels (each is either 8 or 16 depending on the scan type)
    int m_MCUWidth;
    int m_MCUHeight;
+
+   // Selected output type, corrected for image type detected
+   pjpeg_output_type_t m_outputType;
+
+   // Handle to internal data structure
+   void *m_PJHandle;
+
+   // Line buffer for m_MCUHeight output lines
+   void *m_linebuf;
 
    // m_pMCUBufR, m_pMCUBufG, and m_pMCUBufB are pointers to internal MCU Y or RGB pixel component buffers.
    // Each time pjpegDecodeMCU() is called successfully these buffers will be filled with 8x8 pixel blocks of Y or RGB pixels.
@@ -109,18 +132,33 @@ typedef struct
    unsigned char *m_pMCUBufB;
 } pjpeg_image_info_t;
 
-typedef unsigned char (*pjpeg_need_bytes_callback_t)(unsigned char* pBuf, unsigned char buf_size, unsigned char *pBytes_actually_read, void *pCallback_data);
+typedef int (jsread_t)(void *buffer, int size, void *pCallback_data);
+typedef int (jswrite_t)(void *buffer, int size, void *pCallback_data);
 
 // Initializes the decompressor. Returns 0 on success, or one of the above error codes on failure.
-// pNeed_bytes_callback will be called to fill the decompressor's internal input buffer.
-// If reduce is 1, only the first pixel of each block will be decoded. This mode is much faster because it skips the AC dequantization, IDCT and chroma upsampling of every image pixel.
-// Not thread safe.
-unsigned char pjpeg_decode_init(pjpeg_image_info_t *pInfo, pjpeg_need_bytes_callback_t pNeed_bytes_callback, void *pCallback_data, unsigned char reduce);
+// jsread will be called to fill the decompressor's internal input buffer.
+// If reduced output type, only the first pixel pjpeg_output_type_t output_typeof each block will be decoded. This mode is much faster because it skips the AC dequantization, IDCT and chroma upsampling of every image pixel.
+// If RGB565 output type, data format is 2 bytes: |RRRRRGGG|GGGBBBBB|
+unsigned char pjpeg_decode_init(pjpeg_image_info_t *pInfo, jsread_t *jsread, void *pCallback_data, void *storage, pjpeg_output_type_t output_type);
 
 // Decompresses the file's next MCU. Returns 0 on success, PJPG_NO_MORE_BLOCKS if no more blocks are available, or an error code.
 // Must be called a total of m_MCUSPerRow*m_MCUSPerCol times to completely decompress the image.
-// Not thread safe.
-unsigned char pjpeg_decode_mcu(void);
+unsigned char pjpeg_decode_mcu(pjpeg_image_info_t *pInfo);
+
+// Decompresses file and passes scan lines to callback method jswrite.  pCallbackData is
+// a client data pointer passed back to jswrite.  Note that pInfo->m_linebuf must point to
+// a client-supplied buffer of size determined by pjpeg_get_line_buffer_size() after
+// peg_decode_init() is called!
+unsigned char pjpeg_decode_scanlines(pjpeg_image_info_t *pInfo, jswrite_t *jswrite, void *pCallback_data);
+
+// Gets the size of the internal storage needed by pjpeg.  Client is responsible for allocating
+// and managing this storage.
+unsigned int pjpeg_get_storage_size(void);
+
+// Gets the size of the line buffer storage needed for scanlines.  Allocation size is
+// <image_width_pixels>*<MCU_height_lines>*<output_bytes_per_pixel>.  Client is responsible
+// for allocating and managing this storage.
+unsigned int pjpeg_get_line_buffer_size(pjpeg_image_info_t *pInfo);
 
 #ifdef __cplusplus
 }

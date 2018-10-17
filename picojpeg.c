@@ -3,6 +3,8 @@
 // Nov. 27, 2010 - Initial release
 // Feb. 9, 2013 - Added H1V2/H2V1 support, cleaned up macros, signed shift fixes 
 // Also integrated and tested changes from Chris Phoenix <cphoenix@gmail.com>.
+// Oct. 16, 2018 - Made reentrant, added scanline output, added RGB565 output
+// Changes from Scott Wagner <scott.wagner@promethean-design.com>
 //------------------------------------------------------------------------------
 #include "picojpeg.h"
 //------------------------------------------------------------------------------
@@ -13,6 +15,10 @@
 
 // Define PJPG_INLINE to "inline" if your C compiler supports explicit inlining
 #define PJPG_INLINE
+
+// Set RGB565_LITTLE_ENDIAN to 1 for little-endian byte order in RGB565 uint16 pixels
+#define RGB565_LITTLE_ENDIAN 1
+
 //------------------------------------------------------------------------------
 typedef unsigned char   uint8;
 typedef unsigned short  uint16;
@@ -138,207 +144,188 @@ static const int8 ZAG[] =
    53, 60, 61, 54, 47, 55, 62, 63,
 };
 //------------------------------------------------------------------------------
-// 128 bytes
-static int16 gCoeffBuf[8*8];
+#define PJPG_MAX_IN_BUF_SIZE 256
 
-// 8*8*4 bytes * 3 = 768
-static uint8 gMCUBufR[256];
-static uint8 gMCUBufG[256];
-static uint8 gMCUBufB[256];
-
-// 256 bytes
-static int16 gQuant0[8*8];
-static int16 gQuant1[8*8];
-
-// 6 bytes
-static int16 gLastDC[3];
-
-typedef struct HuffTableT
-{
-   uint16 mMinCode[16];
-   uint16 mMaxCode[16];
-   uint8 mValPtr[16];
+typedef struct HuffTableT {
+    uint16 mMinCode[16];
+    uint16 mMaxCode[16];
+    uint8 mValPtr[16];
 } HuffTable;
 
-// DC - 192
-static HuffTable gHuffTab0;
+typedef struct PicoJpegT {
+    int16 CoeffBuf[8*8];  // 128 bytes
+    uint8 MCUBufR[256];   // 8*8*4 bytes * 3 = 768
+    uint8 MCUBufG[256];
+    uint8 MCUBufB[256];
+    int16 Quant0[8*8];    // 256 bytes
+    int16 Quant1[8*8];
+    int16 LastDC[3];      // 6 bytes
+    HuffTable HuffTab0;   // DC - 192
+    uint8 HuffVal0[16];
+    HuffTable HuffTab1;
+    uint8 HuffVal1[16];
+    HuffTable HuffTab2;   // AC - 672
+    uint8 HuffVal2[256];
+    HuffTable HuffTab3;
+    uint8 HuffVal3[256];
+    uint8 ValidHuffTables;
+    uint8 ValidQuantTables;
+    uint8 TemFlag;
+    uint8 InBufOfs;
+    uint8 InBufLeft;
+    uint16 BitBuf;
+    uint8 BitsLeft;
+    uint16 ImageXSize;
+    uint16 ImageYSize;
+    uint8 CompsInFrame;
+    uint8 CompIdent[3];
+    uint8 CompHSamp[3];
+    uint8 CompVSamp[3];
+    uint8 CompQuant[3];
+    uint16 RestartInterval;
+    uint16 NextRestartNum;
+    uint16 RestartsLeft;
+    uint8 CompsInScan;
+    uint8 CompList[3];
+    uint8 CompDCTab[3]; // 0,1
+    uint8 CompACTab[3]; // 0,1
+    pjpeg_scan_type_t ScanType;
+    uint8 MaxBlocksPerMCU;
+    uint8 MaxMCUXSize;
+    uint8 MaxMCUYSize;
+    uint16 MaxMCUSPerRow;
+    uint16 MaxMCUSPerCol;
+    uint16 NumMCUSRemaining;
+    uint8 MCUOrg[6];
+    jsread_t *Jsread;
+    void *pCallback_data;
+    uint8 CallbackStatus;
+    uint8 output_type;
+    uint8 InBuf[PJPG_MAX_IN_BUF_SIZE];
+} PicoJpeg;
 
-static uint8 gHuffVal0[16];
-
-static HuffTable gHuffTab1;
-static uint8 gHuffVal1[16];
-
-// AC - 672
-static HuffTable gHuffTab2;
-static uint8 gHuffVal2[256];
-
-static HuffTable gHuffTab3;
-static uint8 gHuffVal3[256];
-
-static uint8 gValidHuffTables;
-static uint8 gValidQuantTables;
-
-static uint8 gTemFlag;
-#define PJPG_MAX_IN_BUF_SIZE 256
-static uint8 gInBuf[PJPG_MAX_IN_BUF_SIZE];
-static uint8 gInBufOfs;
-static uint8 gInBufLeft;
-
-static uint16 gBitBuf;
-static uint8 gBitsLeft;
 //------------------------------------------------------------------------------
-static uint16 gImageXSize;
-static uint16 gImageYSize;
-static uint8 gCompsInFrame;
-static uint8 gCompIdent[3];
-static uint8 gCompHSamp[3];
-static uint8 gCompVSamp[3];
-static uint8 gCompQuant[3];
-
-static uint16 gRestartInterval;
-static uint16 gNextRestartNum;
-static uint16 gRestartsLeft;
-
-static uint8 gCompsInScan;
-static uint8 gCompList[3];
-static uint8 gCompDCTab[3]; // 0,1
-static uint8 gCompACTab[3]; // 0,1
-
-static pjpeg_scan_type_t gScanType;
-
-static uint8 gMaxBlocksPerMCU;
-static uint8 gMaxMCUXSize;
-static uint8 gMaxMCUYSize;
-static uint16 gMaxMCUSPerRow;
-static uint16 gMaxMCUSPerCol;
-static uint16 gNumMCUSRemaining;
-static uint8 gMCUOrg[6];
-
-static pjpeg_need_bytes_callback_t g_pNeedBytesCallback;
-static void *g_pCallback_data;
-static uint8 gCallbackStatus;
-static uint8 gReduce;
-//------------------------------------------------------------------------------
-static void fillInBuf(void)
+static void fillInBuf(PicoJpeg *pjp)
 {
-   unsigned char status;
-
+   int nread;
    // Reserve a few bytes at the beginning of the buffer for putting back ("stuffing") chars.
-   gInBufOfs = 4;
-   gInBufLeft = 0;
+   pjp->InBufOfs = 4;
+   pjp->InBufLeft = 0;
 
-   status = (*g_pNeedBytesCallback)(gInBuf + gInBufOfs, PJPG_MAX_IN_BUF_SIZE - gInBufOfs, &gInBufLeft, g_pCallback_data);
-   if (status)
-   {
+   nread = (*pjp->Jsread)(pjp->InBuf + pjp->InBufOfs, PJPG_MAX_IN_BUF_SIZE - pjp->InBufOfs, pjp->pCallback_data);
+   if (nread < 0) {
       // The user provided need bytes callback has indicated an error, so record the error and continue trying to decode.
       // The highest level pjpeg entrypoints will catch the error and return the non-zero status.
-      gCallbackStatus = status;
+      pjp->CallbackStatus = (unsigned char)(-nread);
+   } else {
+      pjp->InBufLeft = (unsigned char)nread;
    }
-}   
+}
+
 //------------------------------------------------------------------------------
-static PJPG_INLINE uint8 getChar(void)
+static PJPG_INLINE uint8 getChar(PicoJpeg *pjp)
 {
-   if (!gInBufLeft)
+   if (!pjp->InBufLeft)
    {
-      fillInBuf();
-      if (!gInBufLeft)
+      fillInBuf(pjp);
+      if (!pjp->InBufLeft)
       {
-         gTemFlag = ~gTemFlag;
-         return gTemFlag ? 0xFF : 0xD9;
+         pjp->TemFlag = ~pjp->TemFlag;
+         return pjp->TemFlag ? 0xFF : 0xD9;
       } 
    }
    
-   gInBufLeft--;
-   return gInBuf[gInBufOfs++];
+   pjp->InBufLeft--;
+   return pjp->InBuf[pjp->InBufOfs++];
 }
 //------------------------------------------------------------------------------
-static PJPG_INLINE void stuffChar(uint8 i)
+static PJPG_INLINE void stuffChar(PicoJpeg *pjp, uint8 i)
 {
-   gInBufOfs--;
-   gInBuf[gInBufOfs] = i;
-   gInBufLeft++;
+   pjp->InBufOfs--;
+   pjp->InBuf[pjp->InBufOfs] = i;
+   pjp->InBufLeft++;
 }
 //------------------------------------------------------------------------------
-static PJPG_INLINE uint8 getOctet(uint8 FFCheck)
+static PJPG_INLINE uint8 getOctet(PicoJpeg *pjp, uint8 FFCheck)
 {
-   uint8 c = getChar();
+   uint8 c = getChar(pjp);
       
    if ((FFCheck) && (c == 0xFF))
    {
-      uint8 n = getChar();
+      uint8 n = getChar(pjp);
 
       if (n)
       {
-         stuffChar(n);
-         stuffChar(0xFF);
+         stuffChar(pjp, n);
+         stuffChar(pjp, 0xFF);
       }
    }
 
    return c;
 }
 //------------------------------------------------------------------------------
-static uint16 getBits(uint8 numBits, uint8 FFCheck)
+static uint16 getBits(PicoJpeg *pjp, uint8 numBits, uint8 FFCheck)
 {
    uint8 origBits = numBits;
-   uint16 ret = gBitBuf;
+   uint16 ret = pjp->BitBuf;
    
    if (numBits > 8)
    {
       numBits -= 8;
       
-      gBitBuf <<= gBitsLeft;
+      pjp->BitBuf <<= pjp->BitsLeft;
       
-      gBitBuf |= getOctet(FFCheck);
+      pjp->BitBuf |= getOctet(pjp, FFCheck);
       
-      gBitBuf <<= (8 - gBitsLeft);
+      pjp->BitBuf <<= (8 - pjp->BitsLeft);
       
-      ret = (ret & 0xFF00) | (gBitBuf >> 8);
+      ret = (ret & 0xFF00) | (pjp->BitBuf >> 8);
    }
       
-   if (gBitsLeft < numBits)
+   if (pjp->BitsLeft < numBits)
    {
-      gBitBuf <<= gBitsLeft;
+      pjp->BitBuf <<= pjp->BitsLeft;
       
-      gBitBuf |= getOctet(FFCheck);
+      pjp->BitBuf |= getOctet(pjp, FFCheck);
       
-      gBitBuf <<= (numBits - gBitsLeft);
+      pjp->BitBuf <<= (numBits - pjp->BitsLeft);
                         
-      gBitsLeft = 8 - (numBits - gBitsLeft);
+      pjp->BitsLeft = 8 - (numBits - pjp->BitsLeft);
    }
    else
    {
-      gBitsLeft = (uint8)(gBitsLeft - numBits);
-      gBitBuf <<= numBits;
+      pjp->BitsLeft = (uint8)(pjp->BitsLeft - numBits);
+      pjp->BitBuf <<= numBits;
    }
    
    return ret >> (16 - origBits);
 }
 //------------------------------------------------------------------------------
-static PJPG_INLINE uint16 getBits1(uint8 numBits)
+static PJPG_INLINE uint16 getBits1(PicoJpeg *pjp, uint8 numBits)
 {
-   return getBits(numBits, 0);
+   return getBits(pjp, numBits, 0);
 }
 //------------------------------------------------------------------------------
-static PJPG_INLINE uint16 getBits2(uint8 numBits)
+static PJPG_INLINE uint16 getBits2(PicoJpeg *pjp, uint8 numBits)
 {
-   return getBits(numBits, 1);
+   return getBits(pjp, numBits, 1);
 }
 //------------------------------------------------------------------------------
-static PJPG_INLINE uint8 getBit(void)
+static PJPG_INLINE uint8 getBit(PicoJpeg *pjp)
 {
    uint8 ret = 0;
-   if (gBitBuf & 0x8000) 
+   if (pjp->BitBuf & 0x8000) 
       ret = 1;
    
-   if (!gBitsLeft)
+   if (!pjp->BitsLeft)
    {
-      gBitBuf |= getOctet(1);
+      pjp->BitBuf |= getOctet(pjp, 1);
 
-      gBitsLeft += 8;
+      pjp->BitsLeft += 8;
    }
    
-   gBitsLeft--;
-   gBitBuf <<= 1;
+   pjp->BitsLeft--;
+   pjp->BitBuf <<= 1;
    
    return ret;
 }
@@ -396,11 +383,11 @@ static PJPG_INLINE int16 huffExtend(uint16 x, uint8 s)
    return ((x < getExtendTest(s)) ? ((int16)x + getExtendOffset(s)) : (int16)x);
 }
 //------------------------------------------------------------------------------
-static PJPG_INLINE uint8 huffDecode(const HuffTable* pHuffTable, const uint8* pHuffVal)
+static PJPG_INLINE uint8 huffDecode(PicoJpeg *pjp, const HuffTable* pHuffTable, const uint8* pHuffVal)
 {
    uint8 i = 0;
    uint8 j;
-   uint16 code = getBit();
+   uint16 code = getBit(pjp);
 
    // This func only reads a bit at a time, which on modern CPU's is not terribly efficient.
    // But on microcontrollers without strong integer shifting support this seems like a 
@@ -418,7 +405,7 @@ static PJPG_INLINE uint8 huffDecode(const HuffTable* pHuffTable, const uint8* pH
 
       i++;
       code <<= 1;
-      code |= getBit();
+      code |= getBit(pjp);
    }
 
    j = pHuffTable->mValPtr[i];
@@ -463,30 +450,30 @@ static void huffCreate(const uint8* pBits, HuffTable* pHuffTable)
    }
 }
 //------------------------------------------------------------------------------
-static HuffTable* getHuffTable(uint8 index)
+static HuffTable* getHuffTable(PicoJpeg *pjp, uint8 index)
 {
    // 0-1 = DC
    // 2-3 = AC
    switch (index)
    {
-      case 0: return &gHuffTab0;
-      case 1: return &gHuffTab1;
-      case 2: return &gHuffTab2;
-      case 3: return &gHuffTab3;
+      case 0: return &pjp->HuffTab0;
+      case 1: return &pjp->HuffTab1;
+      case 2: return &pjp->HuffTab2;
+      case 3: return &pjp->HuffTab3;
       default: return 0;
    }
 }
 //------------------------------------------------------------------------------
-static uint8* getHuffVal(uint8 index)
+static uint8* getHuffVal(PicoJpeg *pjp, uint8 index)
 {
    // 0-1 = DC
    // 2-3 = AC
    switch (index)
    {
-      case 0: return gHuffVal0;
-      case 1: return gHuffVal1;
-      case 2: return gHuffVal2;
-      case 3: return gHuffVal3;
+      case 0: return pjp->HuffVal0;
+      case 1: return pjp->HuffVal1;
+      case 2: return pjp->HuffVal2;
+      case 3: return pjp->HuffVal3;
       default: return 0;
    }
 }
@@ -496,10 +483,10 @@ static uint16 getMaxHuffCodes(uint8 index)
    return (index < 2) ? 12 : 255;
 }
 //------------------------------------------------------------------------------
-static uint8 readDHTMarker(void)
+static uint8 readDHTMarker(PicoJpeg *pjp)
 {
    uint8 bits[16];
-   uint16 left = getBits1(16);
+   uint16 left = getBits1(pjp, 16);
 
    if (left < 2)
       return PJPG_BAD_DHT_MARKER;
@@ -513,22 +500,22 @@ static uint8 readDHTMarker(void)
       HuffTable* pHuffTable;
       uint16 count, totalRead;
             
-      index = (uint8)getBits1(8);
+      index = (uint8)getBits1(pjp, 8);
       
       if ( ((index & 0xF) > 1) || ((index & 0xF0) > 0x10) )
          return PJPG_BAD_DHT_INDEX;
       
       tableIndex = ((index >> 3) & 2) + (index & 1);
       
-      pHuffTable = getHuffTable(tableIndex);
-      pHuffVal = getHuffVal(tableIndex);
+      pHuffTable = getHuffTable(pjp, tableIndex);
+      pHuffVal = getHuffVal(pjp, tableIndex);
       
-      gValidHuffTables |= (1 << tableIndex);
+      pjp->ValidHuffTables |= (1 << tableIndex);
             
       count = 0;
       for (i = 0; i <= 15; i++)
       {
-         uint8 n = (uint8)getBits1(8);
+         uint8 n = (uint8)getBits1(pjp, 8);
          bits[i] = n;
          count = (uint16)(count + n);
       }
@@ -537,7 +524,7 @@ static uint8 readDHTMarker(void)
          return PJPG_BAD_DHT_COUNTS;
 
       for (i = 0; i < count; i++)
-         pHuffVal[i] = (uint8)getBits1(8);
+         pHuffVal[i] = (uint8)getBits1(pjp, 8);
 
       totalRead = 1 + 16 + count;
 
@@ -554,9 +541,9 @@ static uint8 readDHTMarker(void)
 //------------------------------------------------------------------------------
 static void createWinogradQuant(int16* pQuant);
 
-static uint8 readDQTMarker(void)
+static uint8 readDQTMarker(PicoJpeg *pjp)
 {
-   uint16 left = getBits1(16);
+   uint16 left = getBits1(pjp, 16);
 
    if (left < 2)
       return PJPG_BAD_DQT_MARKER;
@@ -566,7 +553,7 @@ static uint8 readDQTMarker(void)
    while (left)
    {
       uint8 i;
-      uint8 n = (uint8)getBits1(8);
+      uint8 n = (uint8)getBits1(pjp, 8);
       uint8 prec = n >> 4;
       uint16 totalRead;
 
@@ -575,23 +562,23 @@ static uint8 readDQTMarker(void)
       if (n > 1)
          return PJPG_BAD_DQT_TABLE;
 
-      gValidQuantTables |= (n ? 2 : 1);         
+      pjp->ValidQuantTables |= (n ? 2 : 1);         
 
       // read quantization entries, in zag order
       for (i = 0; i < 64; i++)
       {
-         uint16 temp = getBits1(8);
+         uint16 temp = getBits1(pjp, 8);
 
          if (prec)
-            temp = (temp << 8) + getBits1(8);
+            temp = (temp << 8) + getBits1(pjp, 8);
 
          if (n)
-            gQuant1[i] = (int16)temp;            
+            pjp->Quant1[i] = (int16)temp;            
          else
-            gQuant0[i] = (int16)temp;            
+            pjp->Quant0[i] = (int16)temp;            
       }
       
-      createWinogradQuant(n ? gQuant1 : gQuant0);
+      createWinogradQuant(n ? pjp->Quant1 : pjp->Quant0);
 
       totalRead = 64 + 1;
 
@@ -607,40 +594,56 @@ static uint8 readDQTMarker(void)
    return 0;
 }
 //------------------------------------------------------------------------------
-static uint8 readSOFMarker(void)
+static uint8 readSOFMarker(PicoJpeg *pjp)
 {
    uint8 i;
-   uint16 left = getBits1(16);
+   uint16 left = getBits1(pjp, 16);
 
-   if (getBits1(8) != 8)   
+   if (getBits1(pjp, 8) != 8)   
       return PJPG_BAD_PRECISION;
 
-   gImageYSize = getBits1(16);
+   pjp->ImageYSize = getBits1(pjp, 16);
 
-   if ((!gImageYSize) || (gImageYSize > PJPG_MAX_HEIGHT))
+   if ((!pjp->ImageYSize) || (pjp->ImageYSize > PJPG_MAX_HEIGHT))
       return PJPG_BAD_HEIGHT;
 
-   gImageXSize = getBits1(16);
+   pjp->ImageXSize = getBits1(pjp, 16);
 
-   if ((!gImageXSize) || (gImageXSize > PJPG_MAX_WIDTH))
+   if ((!pjp->ImageXSize) || (pjp->ImageXSize > PJPG_MAX_WIDTH))
       return PJPG_BAD_WIDTH;
 
-   gCompsInFrame = (uint8)getBits1(8);
+   pjp->CompsInFrame = (uint8)getBits1(pjp, 8);
 
-   if (gCompsInFrame > 3)
+   if (pjp->CompsInFrame > 3)
       return PJPG_TOO_MANY_COMPONENTS;
 
-   if (left != (gCompsInFrame + gCompsInFrame + gCompsInFrame + 8))
+   if (left != (pjp->CompsInFrame + pjp->CompsInFrame + pjp->CompsInFrame + 8))
       return PJPG_BAD_SOF_LENGTH;
+
+   if (pjp->CompsInFrame == 1) {
+      if (pjp->output_type == PJPG_RGB888 ||
+            pjp->output_type == PJPG_RGB565) {
+         pjp->output_type = PJPG_GRAY8;
+      } else if (pjp->output_type == PJPG_REDUCED_RGB888 ||
+            pjp->output_type == PJPG_REDUCED_RGB565) {
+         pjp->output_type = PJPG_REDUCED_GRAY8;
+      }
+   } else if (pjp->CompsInFrame == 3) {
+      if (pjp->output_type == PJPG_GRAY8) {
+         pjp->output_type = PJPG_RGB888;
+      } else if (pjp->output_type == PJPG_REDUCED_GRAY8) {
+         pjp->output_type = PJPG_REDUCED_RGB888;
+      }
+   }
    
-   for (i = 0; i < gCompsInFrame; i++)
+   for (i = 0; i < pjp->CompsInFrame; i++)
    {
-      gCompIdent[i] = (uint8)getBits1(8);
-      gCompHSamp[i] = (uint8)getBits1(4);
-      gCompVSamp[i] = (uint8)getBits1(4);
-      gCompQuant[i] = (uint8)getBits1(8);
+      pjp->CompIdent[i] = (uint8)getBits1(pjp, 8);
+      pjp->CompHSamp[i] = (uint8)getBits1(pjp, 4);
+      pjp->CompVSamp[i] = (uint8)getBits1(pjp, 4);
+      pjp->CompQuant[i] = (uint8)getBits1(pjp, 8);
       
-      if (gCompQuant[i] > 1)
+      if (pjp->CompQuant[i] > 1)
          return PJPG_UNSUPPORTED_QUANT_TABLE;
    }
    
@@ -648,9 +651,9 @@ static uint8 readSOFMarker(void)
 }
 //------------------------------------------------------------------------------
 // Used to skip unrecognized markers.
-static uint8 skipVariableMarker(void)
+static uint8 skipVariableMarker(PicoJpeg *pjp)
 {
-   uint16 left = getBits1(16);
+   uint16 left = getBits1(pjp, 16);
 
    if (left < 2)
       return PJPG_BAD_VARIABLE_MARKER;
@@ -659,7 +662,7 @@ static uint8 skipVariableMarker(void)
 
    while (left)
    {
-      getBits1(8);
+      getBits1(pjp, 8);
       left--;
    }
    
@@ -667,67 +670,70 @@ static uint8 skipVariableMarker(void)
 }
 //------------------------------------------------------------------------------
 // Read a define restart interval (DRI) marker.
-static uint8 readDRIMarker(void)
+static uint8 readDRIMarker(PicoJpeg *pjp)
 {
-   if (getBits1(16) != 4)
+   if (getBits1(pjp, 16) != 4)
       return PJPG_BAD_DRI_LENGTH;
 
-   gRestartInterval = getBits1(16);
+   pjp->RestartInterval = getBits1(pjp, 16);
    
    return 0;
 }
 //------------------------------------------------------------------------------
 // Read a start of scan (SOS) marker.
-static uint8 readSOSMarker(void)
+static uint8 readSOSMarker(PicoJpeg *pjp)
 {
    uint8 i;
-   uint16 left = getBits1(16);
+   uint16 left = getBits1(pjp, 16);
    uint8 spectral_start, spectral_end, successive_high, successive_low;
 
-   gCompsInScan = (uint8)getBits1(8);
+   pjp->CompsInScan = (uint8)getBits1(pjp, 8);
 
    left -= 3;
 
-   if ( (left != (gCompsInScan + gCompsInScan + 3)) || (gCompsInScan < 1) || (gCompsInScan > PJPG_MAXCOMPSINSCAN) )
+   if ( (left != (pjp->CompsInScan + pjp->CompsInScan + 3)) || (pjp->CompsInScan < 1) || (pjp->CompsInScan > PJPG_MAXCOMPSINSCAN) )
       return PJPG_BAD_SOS_LENGTH;
    
-   for (i = 0; i < gCompsInScan; i++)
+   for (i = 0; i < pjp->CompsInScan; i++)
    {
-      uint8 cc = (uint8)getBits1(8);
-      uint8 c = (uint8)getBits1(8);
+      uint8 cc = (uint8)getBits1(pjp, 8);
+      uint8 c = (uint8)getBits1(pjp, 8);
       uint8 ci;
       
       left -= 2;
      
-      for (ci = 0; ci < gCompsInFrame; ci++)
-         if (cc == gCompIdent[ci])
+      for (ci = 0; ci < pjp->CompsInFrame; ci++)
+         if (cc == pjp->CompIdent[ci])
             break;
 
-      if (ci >= gCompsInFrame)
+      if (ci >= pjp->CompsInFrame)
          return PJPG_BAD_SOS_COMP_ID;
 
-      gCompList[i]    = ci;
-      gCompDCTab[ci] = (c >> 4) & 15;
-      gCompACTab[ci] = (c & 15);
+      pjp->CompList[i]    = ci;
+      pjp->CompDCTab[ci] = (c >> 4) & 15;
+      pjp->CompACTab[ci] = (c & 15);
    }
 
-   spectral_start  = (uint8)getBits1(8);
-   spectral_end    = (uint8)getBits1(8);
-   successive_high = (uint8)getBits1(4);
-   successive_low  = (uint8)getBits1(4);
+   spectral_start  = (uint8)getBits1(pjp, 8);
+   spectral_end    = (uint8)getBits1(pjp, 8);
+   successive_high = (uint8)getBits1(pjp, 4);
+   successive_low  = (uint8)getBits1(pjp, 4);
+   if (spectral_start != 0 || spectral_end != 63 || successive_high != 0 || successive_low != 0) {
+      return PJPG_BAD_SOS_COMP_ID;
+   }
 
    left -= 3;
 
    while (left)                  
    {
-      getBits1(8);
+      getBits1(pjp, 8);
       left--;
    }
    
    return 0;
 }
 //------------------------------------------------------------------------------
-static uint8 nextMarker(void)
+static uint8 nextMarker(PicoJpeg *pjp)
 {
    uint8 c;
    uint8 bytes = 0;
@@ -738,13 +744,13 @@ static uint8 nextMarker(void)
       {
          bytes++;
 
-         c = (uint8)getBits1(8);
+         c = (uint8)getBits1(pjp, 8);
 
       } while (c != 0xFF);
 
       do
       {
-         c = (uint8)getBits1(8);
+         c = (uint8)getBits1(pjp, 8);
 
       } while (c == 0xFF);
 
@@ -757,11 +763,11 @@ static uint8 nextMarker(void)
 //------------------------------------------------------------------------------
 // Process markers. Returns when an SOFx, SOI, EOI, or SOS marker is
 // encountered.
-static uint8 processMarkers(uint8* pMarker)
+static uint8 processMarkers(PicoJpeg *pjp, uint8* pMarker)
 {
    for ( ; ; )
    {
-      uint8 c = nextMarker();
+      uint8 c = nextMarker(pjp);
 
       switch (c)
       {
@@ -788,7 +794,7 @@ static uint8 processMarkers(uint8* pMarker)
          }
          case M_DHT:
          {
-            readDHTMarker();
+            readDHTMarker(pjp);
             break;
          }
          // Sorry, no arithmetic support at this time. Dumb patents!
@@ -798,12 +804,12 @@ static uint8 processMarkers(uint8* pMarker)
          }
          case M_DQT:
          {
-            readDQTMarker();
+            readDQTMarker(pjp);
             break;
          }
          case M_DRI:
          {
-            readDRIMarker();
+            readDRIMarker(pjp);
             break;
          }
          //case M_APP0:  /* no need to read the JFIF marker */
@@ -823,7 +829,7 @@ static uint8 processMarkers(uint8* pMarker)
          }
          default:    /* must be DNL, DHP, EXP, APPn, JPGn, COM, or RESn or APP0 */
          {
-            skipVariableMarker();
+            skipVariableMarker(pjp);
             break;
          }
       }
@@ -832,13 +838,13 @@ static uint8 processMarkers(uint8* pMarker)
 }
 //------------------------------------------------------------------------------
 // Finds the start of image (SOI) marker.
-static uint8 locateSOIMarker(void)
+static uint8 locateSOIMarker(PicoJpeg *pjp)
 {
    uint16 bytesleft;
    
-   uint8 lastchar = (uint8)getBits1(8);
+   uint8 lastchar = (uint8)getBits1(pjp, 8);
 
-   uint8 thischar = (uint8)getBits1(8);
+   uint8 thischar = (uint8)getBits1(pjp, 8);
 
    /* ok if it's a normal JPEG file without a special header */
 
@@ -854,7 +860,7 @@ static uint8 locateSOIMarker(void)
 
       lastchar = thischar;
 
-      thischar = (uint8)getBits1(8);
+      thischar = (uint8)getBits1(pjp, 8);
 
       if (lastchar == 0xFF) 
       {
@@ -868,24 +874,24 @@ static uint8 locateSOIMarker(void)
    /* Check the next character after marker: if it's not 0xFF, it can't
    be the start of the next marker, so the file is bad */
 
-   thischar = (uint8)((gBitBuf >> 8) & 0xFF);
+   thischar = (uint8)((pjp->BitBuf >> 8) & 0xFF);
 
    if (thischar != 0xFF)
       return PJPG_NOT_JPEG;
-      
+
    return 0;
 }
 //------------------------------------------------------------------------------
 // Find a start of frame (SOF) marker.
-static uint8 locateSOFMarker(void)
+static uint8 locateSOFMarker(PicoJpeg *pjp)
 {
    uint8 c;
 
-   uint8 status = locateSOIMarker();
+   uint8 status = locateSOIMarker(pjp);
    if (status)
       return status;
    
-   status = processMarkers(&c);
+   status = processMarkers(pjp, &c);
    if (status)
       return status;
 
@@ -899,7 +905,7 @@ static uint8 locateSOFMarker(void)
       }
       case M_SOF0:  /* baseline DCT */
       {
-         status = readSOFMarker();
+         status = readSOFMarker(pjp);
          if (status)
             return status;
             
@@ -920,14 +926,14 @@ static uint8 locateSOFMarker(void)
 }
 //------------------------------------------------------------------------------
 // Find a start of scan (SOS) marker.
-static uint8 locateSOSMarker(uint8* pFoundEOI)
+static uint8 locateSOSMarker(PicoJpeg *pjp, uint8* pFoundEOI)
 {
    uint8 c;
    uint8 status;
 
    *pFoundEOI = 0;
       
-   status = processMarkers(&c);
+   status = processMarkers(pjp, &c);
    if (status)
       return status;
 
@@ -939,48 +945,27 @@ static uint8 locateSOSMarker(uint8* pFoundEOI)
    else if (c != M_SOS)
       return PJPG_UNEXPECTED_MARKER;
 
-   return readSOSMarker();
-}
-//------------------------------------------------------------------------------
-static uint8 init(void)
-{
-   gImageXSize = 0;
-   gImageYSize = 0;
-   gCompsInFrame = 0;
-   gRestartInterval = 0;
-   gCompsInScan = 0;
-   gValidHuffTables = 0;
-   gValidQuantTables = 0;
-   gTemFlag = 0;
-   gInBufOfs = 0;
-   gInBufLeft = 0;
-   gBitBuf = 0;
-   gBitsLeft = 8;
-
-   getBits1(8);
-   getBits1(8);
-
-   return 0;
+   return readSOSMarker(pjp);
 }
 //------------------------------------------------------------------------------
 // This method throws back into the stream any bytes that where read
 // into the bit buffer during initial marker scanning.
-static void fixInBuffer(void)
+static void fixInBuffer(PicoJpeg *pjp)
 {
    /* In case any 0xFF's where pulled into the buffer during marker scanning */
 
-   if (gBitsLeft > 0)  
-      stuffChar((uint8)gBitBuf);
+   if (pjp->BitsLeft > 0)  
+      stuffChar(pjp, (uint8)pjp->BitBuf);
    
-   stuffChar((uint8)(gBitBuf >> 8));
+   stuffChar(pjp, (uint8)(pjp->BitBuf >> 8));
    
-   gBitsLeft = 8;
-   getBits2(8);
-   getBits2(8);
+   pjp->BitsLeft = 8;
+   getBits2(pjp, 8);
+   getBits2(pjp, 8);
 }
 //------------------------------------------------------------------------------
 // Restart interval processing.
-static uint8 processRestart(void)
+static uint8 processRestart(PicoJpeg *pjp)
 {
    // Let's scan a little bit to find the marker, but not _too_ far.
    // 1536 is a "fudge factor" that determines how much to scan.
@@ -988,59 +973,60 @@ static uint8 processRestart(void)
    uint8 c = 0;
 
    for (i = 1536; i > 0; i--)
-      if (getChar() == 0xFF)
+      if (getChar(pjp) == 0xFF)
          break;
 
    if (i == 0)
       return PJPG_BAD_RESTART_MARKER;
    
    for ( ; i > 0; i--)
-      if ((c = getChar()) != 0xFF)
+      if ((c = getChar(pjp)) != 0xFF)
          break;
 
    if (i == 0)
       return PJPG_BAD_RESTART_MARKER;
 
    // Is it the expected marker? If not, something bad happened.
-   if (c != (gNextRestartNum + M_RST0))
+   if (c != (pjp->NextRestartNum + M_RST0))
       return PJPG_BAD_RESTART_MARKER;
 
    // Reset each component's DC prediction values.
-   gLastDC[0] = 0;
-   gLastDC[1] = 0;
-   gLastDC[2] = 0;
+   pjp->LastDC[0] = 0;
+   pjp->LastDC[1] = 0;
+   pjp->LastDC[2] = 0;
 
-   gRestartsLeft = gRestartInterval;
+   pjp->RestartsLeft = pjp->RestartInterval;
 
-   gNextRestartNum = (gNextRestartNum + 1) & 7;
+   pjp->NextRestartNum = (pjp->NextRestartNum + 1) & 7;
 
    // Get the bit buffer going again
 
-   gBitsLeft = 8;
-   getBits2(8);
-   getBits2(8);
+   pjp->BitsLeft = 8;
+   getBits2(pjp, 8);
+   getBits2(pjp, 8);
    
    return 0;
 }
 //------------------------------------------------------------------------------
+#if 0
 // FIXME: findEOI() is not actually called at the end of the image 
 // (it's optional, and probably not needed on embedded devices)
-static uint8 findEOI(void)
+static uint8 findEOI(PicoJpeg *pjp)
 {
    uint8 c;
    uint8 status;
 
    // Prime the bit buffer
-   gBitsLeft = 8;
-   getBits1(8);
-   getBits1(8);
+   pjp->BitsLeft = 8;
+   getBits1(pjp, 8);
+   getBits1(pjp, 8);
 
    // The next marker _should_ be EOI
-   status = processMarkers(&c);
+   status = processMarkers(pjp, &c);
    if (status)
       return status;
-   else if (gCallbackStatus)
-      return gCallbackStatus;
+   else if (pjp->CallbackStatus)
+      return pjp->CallbackStatus;
    
    //gTotalBytesRead -= in_buf_left;
    if (c != M_EOI)
@@ -1048,144 +1034,145 @@ static uint8 findEOI(void)
    
    return 0;
 }
+#endif
 //------------------------------------------------------------------------------
-static uint8 checkHuffTables(void)
+static uint8 checkHuffTables(PicoJpeg *pjp)
 {
    uint8 i;
 
-   for (i = 0; i < gCompsInScan; i++)
+   for (i = 0; i < pjp->CompsInScan; i++)
    {
-      uint8 compDCTab = gCompDCTab[gCompList[i]];
-      uint8 compACTab = gCompACTab[gCompList[i]] + 2;
+      uint8 compDCTab = pjp->CompDCTab[pjp->CompList[i]];
+      uint8 compACTab = pjp->CompACTab[pjp->CompList[i]] + 2;
       
-      if ( ((gValidHuffTables & (1 << compDCTab)) == 0) ||
-           ((gValidHuffTables & (1 << compACTab)) == 0) )
+      if ( ((pjp->ValidHuffTables & (1 << compDCTab)) == 0) ||
+           ((pjp->ValidHuffTables & (1 << compACTab)) == 0) )
          return PJPG_UNDEFINED_HUFF_TABLE;           
    }
    
    return 0;
 }
 //------------------------------------------------------------------------------
-static uint8 checkQuantTables(void)
+static uint8 checkQuantTables(PicoJpeg *pjp)
 {
    uint8 i;
 
-   for (i = 0; i < gCompsInScan; i++)
+   for (i = 0; i < pjp->CompsInScan; i++)
    {
-      uint8 compQuantMask = gCompQuant[gCompList[i]] ? 2 : 1;
+      uint8 compQuantMask = pjp->CompQuant[pjp->CompList[i]] ? 2 : 1;
       
-      if ((gValidQuantTables & compQuantMask) == 0)
+      if ((pjp->ValidQuantTables & compQuantMask) == 0)
          return PJPG_UNDEFINED_QUANT_TABLE;
    }         
 
    return 0;         
 }
 //------------------------------------------------------------------------------
-static uint8 initScan(void)
+static uint8 initScan(PicoJpeg *pjp)
 {
    uint8 foundEOI;
-   uint8 status = locateSOSMarker(&foundEOI);
+   uint8 status = locateSOSMarker(pjp, &foundEOI);
    if (status)
       return status;
    if (foundEOI)
       return PJPG_UNEXPECTED_MARKER;
    
-   status = checkHuffTables();
+   status = checkHuffTables(pjp);
    if (status)
       return status;
 
-   status = checkQuantTables();
+   status = checkQuantTables(pjp);
    if (status)
       return status;
 
-   gLastDC[0] = 0;
-   gLastDC[1] = 0;
-   gLastDC[2] = 0;
+   pjp->LastDC[0] = 0;
+   pjp->LastDC[1] = 0;
+   pjp->LastDC[2] = 0;
 
-   if (gRestartInterval)
+   if (pjp->RestartInterval)
    {
-      gRestartsLeft = gRestartInterval;
-      gNextRestartNum = 0;
+      pjp->RestartsLeft = pjp->RestartInterval;
+      pjp->NextRestartNum = 0;
    }
 
-   fixInBuffer();
+   fixInBuffer(pjp);
 
    return 0;
 }
 //------------------------------------------------------------------------------
-static uint8 initFrame(void)
+static uint8 initFrame(PicoJpeg *pjp)
 {
-   if (gCompsInFrame == 1)
+   if (pjp->CompsInFrame == 1)
    {
-      if ((gCompHSamp[0] != 1) || (gCompVSamp[0] != 1))
+      if ((pjp->CompHSamp[0] != 1) || (pjp->CompVSamp[0] != 1))
          return PJPG_UNSUPPORTED_SAMP_FACTORS;
 
-      gScanType = PJPG_GRAYSCALE;
+      pjp->ScanType = PJPG_GRAYSCALE;
 
-      gMaxBlocksPerMCU = 1;
-      gMCUOrg[0] = 0;
+      pjp->MaxBlocksPerMCU = 1;
+      pjp->MCUOrg[0] = 0;
 
-      gMaxMCUXSize     = 8;
-      gMaxMCUYSize     = 8;
+      pjp->MaxMCUXSize     = 8;
+      pjp->MaxMCUYSize     = 8;
    }
-   else if (gCompsInFrame == 3)
+   else if (pjp->CompsInFrame == 3)
    {
-      if ( ((gCompHSamp[1] != 1) || (gCompVSamp[1] != 1)) ||
-         ((gCompHSamp[2] != 1) || (gCompVSamp[2] != 1)) )
+      if ( ((pjp->CompHSamp[1] != 1) || (pjp->CompVSamp[1] != 1)) ||
+         ((pjp->CompHSamp[2] != 1) || (pjp->CompVSamp[2] != 1)) )
          return PJPG_UNSUPPORTED_SAMP_FACTORS;
 
-      if ((gCompHSamp[0] == 1) && (gCompVSamp[0] == 1))
+      if ((pjp->CompHSamp[0] == 1) && (pjp->CompVSamp[0] == 1))
       {
-         gScanType = PJPG_YH1V1;
+         pjp->ScanType = PJPG_YH1V1;
 
-         gMaxBlocksPerMCU = 3;
-         gMCUOrg[0] = 0;
-         gMCUOrg[1] = 1;
-         gMCUOrg[2] = 2;
+         pjp->MaxBlocksPerMCU = 3;
+         pjp->MCUOrg[0] = 0;
+         pjp->MCUOrg[1] = 1;
+         pjp->MCUOrg[2] = 2;
                   
-         gMaxMCUXSize = 8;
-         gMaxMCUYSize = 8;
+         pjp->MaxMCUXSize = 8;
+         pjp->MaxMCUYSize = 8;
       }
-      else if ((gCompHSamp[0] == 1) && (gCompVSamp[0] == 2))
+      else if ((pjp->CompHSamp[0] == 1) && (pjp->CompVSamp[0] == 2))
       {
-         gScanType = PJPG_YH1V2;
+         pjp->ScanType = PJPG_YH1V2;
 
-         gMaxBlocksPerMCU = 4;
-         gMCUOrg[0] = 0;
-         gMCUOrg[1] = 0;
-         gMCUOrg[2] = 1;
-         gMCUOrg[3] = 2;
+         pjp->MaxBlocksPerMCU = 4;
+         pjp->MCUOrg[0] = 0;
+         pjp->MCUOrg[1] = 0;
+         pjp->MCUOrg[2] = 1;
+         pjp->MCUOrg[3] = 2;
 
-         gMaxMCUXSize = 8;
-         gMaxMCUYSize = 16;
+         pjp->MaxMCUXSize = 8;
+         pjp->MaxMCUYSize = 16;
       }
-      else if ((gCompHSamp[0] == 2) && (gCompVSamp[0] == 1))
+      else if ((pjp->CompHSamp[0] == 2) && (pjp->CompVSamp[0] == 1))
       {
-         gScanType = PJPG_YH2V1;
+         pjp->ScanType = PJPG_YH2V1;
 
-         gMaxBlocksPerMCU = 4;
-         gMCUOrg[0] = 0;
-         gMCUOrg[1] = 0;
-         gMCUOrg[2] = 1;
-         gMCUOrg[3] = 2;
+         pjp->MaxBlocksPerMCU = 4;
+         pjp->MCUOrg[0] = 0;
+         pjp->MCUOrg[1] = 0;
+         pjp->MCUOrg[2] = 1;
+         pjp->MCUOrg[3] = 2;
 
-         gMaxMCUXSize = 16;
-         gMaxMCUYSize = 8;
+         pjp->MaxMCUXSize = 16;
+         pjp->MaxMCUYSize = 8;
       }
-      else if ((gCompHSamp[0] == 2) && (gCompVSamp[0] == 2))
+      else if ((pjp->CompHSamp[0] == 2) && (pjp->CompVSamp[0] == 2))
       {
-         gScanType = PJPG_YH2V2;
+         pjp->ScanType = PJPG_YH2V2;
 
-         gMaxBlocksPerMCU = 6;
-         gMCUOrg[0] = 0;
-         gMCUOrg[1] = 0;
-         gMCUOrg[2] = 0;
-         gMCUOrg[3] = 0;
-         gMCUOrg[4] = 1;
-         gMCUOrg[5] = 2;
+         pjp->MaxBlocksPerMCU = 6;
+         pjp->MCUOrg[0] = 0;
+         pjp->MCUOrg[1] = 0;
+         pjp->MCUOrg[2] = 0;
+         pjp->MCUOrg[3] = 0;
+         pjp->MCUOrg[4] = 1;
+         pjp->MCUOrg[5] = 2;
 
-         gMaxMCUXSize = 16;
-         gMaxMCUYSize = 16;
+         pjp->MaxMCUXSize = 16;
+         pjp->MaxMCUYSize = 16;
       }
       else
          return PJPG_UNSUPPORTED_SAMP_FACTORS;
@@ -1193,10 +1180,10 @@ static uint8 initFrame(void)
    else
       return PJPG_UNSUPPORTED_COLORSPACE;
 
-   gMaxMCUSPerRow = (gImageXSize + (gMaxMCUXSize - 1)) >> ((gMaxMCUXSize == 8) ? 3 : 4);
-   gMaxMCUSPerCol = (gImageYSize + (gMaxMCUYSize - 1)) >> ((gMaxMCUYSize == 8) ? 3 : 4);
+   pjp->MaxMCUSPerRow = (pjp->ImageXSize + (pjp->MaxMCUXSize - 1)) >> ((pjp->MaxMCUXSize == 8) ? 3 : 4);
+   pjp->MaxMCUSPerCol = (pjp->ImageYSize + (pjp->MaxMCUYSize - 1)) >> ((pjp->MaxMCUYSize == 8) ? 3 : 4);
    
-   gNumMCUSRemaining = gMaxMCUSPerRow * gMaxMCUSPerCol;
+   pjp->NumMCUSRemaining = pjp->MaxMCUSPerRow * pjp->MaxMCUSPerCol;
    
    return 0;
 }
@@ -1291,10 +1278,9 @@ static PJPG_INLINE uint8 clamp(int16 s)
    return (uint8)s;
 }
 
-static void idctRows(void)
+static void idctRows(int16* pSrc)
 {
    uint8 i;
-   int16* pSrc = gCoeffBuf;
             
    for (i = 0; i < 8; i++)
    {
@@ -1366,12 +1352,10 @@ static void idctRows(void)
    }      
 }
 
-static void idctCols(void)
+static void idctCols(int16* pSrc)
 {
    uint8 i;
-      
-   int16* pSrc = gCoeffBuf;
-   
+
    for (i = 0; i < 8; i++)
    {
       if ((pSrc[1*8] | pSrc[2*8] | pSrc[3*8] | pSrc[4*8] | pSrc[5*8] | pSrc[6*8] | pSrc[7*8]) == 0)
@@ -1484,13 +1468,13 @@ static PJPG_INLINE uint8 subAndClamp(uint8 a, int16 b)
 //B = Y + 1.772 (Cb-128)
 /*----------------------------------------------------------------------------*/
 // Cb upsample and accumulate, 4x4 to 8x8
-static void upsampleCb(uint8 srcOfs, uint8 dstOfs)
+static void upsampleCb(PicoJpeg *pjp, uint8 srcOfs, uint8 dstOfs)
 {
    // Cb - affects G and B
    uint8 x, y;
-   int16* pSrc = gCoeffBuf + srcOfs;
-   uint8* pDstG = gMCUBufG + dstOfs;
-   uint8* pDstB = gMCUBufB + dstOfs;
+   int16* pSrc = pjp->CoeffBuf+ srcOfs;
+   uint8* pDstG = pjp->MCUBufG + dstOfs;
+   uint8* pDstB = pjp->MCUBufB + dstOfs;
    for (y = 0; y < 4; y++)
    {
       for (x = 0; x < 4; x++)
@@ -1521,13 +1505,13 @@ static void upsampleCb(uint8 srcOfs, uint8 dstOfs)
 }   
 /*----------------------------------------------------------------------------*/
 // Cb upsample and accumulate, 4x8 to 8x8
-static void upsampleCbH(uint8 srcOfs, uint8 dstOfs)
+static void upsampleCbH(PicoJpeg *pjp, uint8 srcOfs, uint8 dstOfs)
 {
    // Cb - affects G and B
    uint8 x, y;
-   int16* pSrc = gCoeffBuf + srcOfs;
-   uint8* pDstG = gMCUBufG + dstOfs;
-   uint8* pDstB = gMCUBufB + dstOfs;
+   int16* pSrc = pjp->CoeffBuf+ srcOfs;
+   uint8* pDstG = pjp->MCUBufG + dstOfs;
+   uint8* pDstB = pjp->MCUBufB + dstOfs;
    for (y = 0; y < 8; y++)
    {
       for (x = 0; x < 4; x++)
@@ -1552,13 +1536,13 @@ static void upsampleCbH(uint8 srcOfs, uint8 dstOfs)
 }   
 /*----------------------------------------------------------------------------*/
 // Cb upsample and accumulate, 8x4 to 8x8
-static void upsampleCbV(uint8 srcOfs, uint8 dstOfs)
+static void upsampleCbV(PicoJpeg *pjp, uint8 srcOfs, uint8 dstOfs)
 {
    // Cb - affects G and B
    uint8 x, y;
-   int16* pSrc = gCoeffBuf + srcOfs;
-   uint8* pDstG = gMCUBufG + dstOfs;
-   uint8* pDstB = gMCUBufB + dstOfs;
+   int16* pSrc = pjp->CoeffBuf+ srcOfs;
+   uint8* pDstG = pjp->MCUBufG + dstOfs;
+   uint8* pDstB = pjp->MCUBufB + dstOfs;
    for (y = 0; y < 4; y++)
    {
       for (x = 0; x < 8; x++)
@@ -1593,13 +1577,13 @@ static void upsampleCbV(uint8 srcOfs, uint8 dstOfs)
 //B = Y + 1.772 (Cb-128)
 /*----------------------------------------------------------------------------*/
 // Cr upsample and accumulate, 4x4 to 8x8
-static void upsampleCr(uint8 srcOfs, uint8 dstOfs)
+static void upsampleCr(PicoJpeg *pjp, uint8 srcOfs, uint8 dstOfs)
 {
    // Cr - affects R and G
    uint8 x, y;
-   int16* pSrc = gCoeffBuf + srcOfs;
-   uint8* pDstR = gMCUBufR + dstOfs;
-   uint8* pDstG = gMCUBufG + dstOfs;
+   int16* pSrc = pjp->CoeffBuf+ srcOfs;
+   uint8* pDstR = pjp->MCUBufR+ dstOfs;
+   uint8* pDstG = pjp->MCUBufG + dstOfs;
    for (y = 0; y < 4; y++)
    {
       for (x = 0; x < 4; x++)
@@ -1630,13 +1614,13 @@ static void upsampleCr(uint8 srcOfs, uint8 dstOfs)
 }   
 /*----------------------------------------------------------------------------*/
 // Cr upsample and accumulate, 4x8 to 8x8
-static void upsampleCrH(uint8 srcOfs, uint8 dstOfs)
+static void upsampleCrH(PicoJpeg *pjp, uint8 srcOfs, uint8 dstOfs)
 {
    // Cr - affects R and G
    uint8 x, y;
-   int16* pSrc = gCoeffBuf + srcOfs;
-   uint8* pDstR = gMCUBufR + dstOfs;
-   uint8* pDstG = gMCUBufG + dstOfs;
+   int16* pSrc = pjp->CoeffBuf+ srcOfs;
+   uint8* pDstR = pjp->MCUBufR+ dstOfs;
+   uint8* pDstG = pjp->MCUBufG + dstOfs;
    for (y = 0; y < 8; y++)
    {
       for (x = 0; x < 4; x++)
@@ -1661,13 +1645,13 @@ static void upsampleCrH(uint8 srcOfs, uint8 dstOfs)
 }   
 /*----------------------------------------------------------------------------*/
 // Cr upsample and accumulate, 8x4 to 8x8
-static void upsampleCrV(uint8 srcOfs, uint8 dstOfs)
+static void upsampleCrV(PicoJpeg *pjp, uint8 srcOfs, uint8 dstOfs)
 {
    // Cr - affects R and G
    uint8 x, y;
-   int16* pSrc = gCoeffBuf + srcOfs;
-   uint8* pDstR = gMCUBufR + dstOfs;
-   uint8* pDstG = gMCUBufG + dstOfs;
+   int16* pSrc = pjp->CoeffBuf+ srcOfs;
+   uint8* pDstR = pjp->MCUBufR+ dstOfs;
+   uint8* pDstG = pjp->MCUBufG + dstOfs;
    for (y = 0; y < 4; y++)
    {
       for (x = 0; x < 8; x++)
@@ -1693,13 +1677,13 @@ static void upsampleCrV(uint8 srcOfs, uint8 dstOfs)
 } 
 /*----------------------------------------------------------------------------*/
 // Convert Y to RGB
-static void copyY(uint8 dstOfs)
+static void copyY(PicoJpeg *pjp, uint8 dstOfs)
 {
    uint8 i;
-   uint8* pRDst = gMCUBufR + dstOfs;
-   uint8* pGDst = gMCUBufG + dstOfs;
-   uint8* pBDst = gMCUBufB + dstOfs;
-   int16* pSrc = gCoeffBuf;
+   uint8* pRDst = pjp->MCUBufR+ dstOfs;
+   uint8* pGDst = pjp->MCUBufG + dstOfs;
+   uint8* pBDst = pjp->MCUBufB + dstOfs;
+   int16* pSrc = pjp->CoeffBuf;
    
    for (i = 64; i > 0; i--)
    {
@@ -1712,12 +1696,12 @@ static void copyY(uint8 dstOfs)
 }
 /*----------------------------------------------------------------------------*/
 // Cb convert to RGB and accumulate
-static void convertCb(uint8 dstOfs)
+static void convertCb(PicoJpeg *pjp, uint8 dstOfs)
 {
    uint8 i;
-   uint8* pDstG = gMCUBufG + dstOfs;
-   uint8* pDstB = gMCUBufB + dstOfs;
-   int16* pSrc = gCoeffBuf;
+   uint8* pDstG = pjp->MCUBufG + dstOfs;
+   uint8* pDstB = pjp->MCUBufB + dstOfs;
+   int16* pSrc = pjp->CoeffBuf;
 
    for (i = 64; i > 0; i--)
    {
@@ -1725,20 +1709,22 @@ static void convertCb(uint8 dstOfs)
       int16 cbG, cbB;
 
       cbG = ((cb * 88U) >> 8U) - 44U;
-      *pDstG++ = subAndClamp(pDstG[0], cbG);
+      *pDstG = subAndClamp(*pDstG, cbG);
+      pDstG++;
 
       cbB = (cb + ((cb * 198U) >> 8U)) - 227U;
-      *pDstB++ = addAndClamp(pDstB[0], cbB);
+      *pDstB = addAndClamp(*pDstB, cbB);
+      pDstB++;
    }
 }
 /*----------------------------------------------------------------------------*/
 // Cr convert to RGB and accumulate
-static void convertCr(uint8 dstOfs)
+static void convertCr(PicoJpeg *pjp, uint8 dstOfs)
 {
    uint8 i;
-   uint8* pDstR = gMCUBufR + dstOfs;
-   uint8* pDstG = gMCUBufG + dstOfs;
-   int16* pSrc = gCoeffBuf;
+   uint8* pDstR = pjp->MCUBufR+ dstOfs;
+   uint8* pDstG = pjp->MCUBufG + dstOfs;
+   int16* pSrc = pjp->CoeffBuf;
 
    for (i = 64; i > 0; i--)
    {
@@ -1746,24 +1732,26 @@ static void convertCr(uint8 dstOfs)
       int16 crR, crG;
 
       crR = (cr + ((cr * 103U) >> 8U)) - 179;
-      *pDstR++ = addAndClamp(pDstR[0], crR);
+      *pDstR = addAndClamp(*pDstR, crR);
+      pDstR++;
 
       crG = ((cr * 183U) >> 8U) - 91;
-      *pDstG++ = subAndClamp(pDstG[0], crG);
+      *pDstG = subAndClamp(*pDstG, crG);
+      pDstG++;
    }
 }
 /*----------------------------------------------------------------------------*/
-static void transformBlock(uint8 mcuBlock)
+static void transformBlock(PicoJpeg *pjp, uint8 mcuBlock)
 {
-   idctRows();
-   idctCols();
+   idctRows(pjp->CoeffBuf);
+   idctCols(pjp->CoeffBuf);
    
-   switch (gScanType)
+   switch (pjp->ScanType)
    {
       case PJPG_GRAYSCALE:
       {
          // MCU size: 1, 1 block per MCU
-         copyY(0);
+         copyY(pjp, 0);
          break;
       }
       case PJPG_YH1V1:
@@ -1773,17 +1761,17 @@ static void transformBlock(uint8 mcuBlock)
          {
             case 0:
             {
-               copyY(0);
+               copyY(pjp, 0);
                break;
             }
             case 1:
             {
-               convertCb(0);
+               convertCb(pjp, 0);
                break;
             }
             case 2:
             {
-               convertCr(0);
+               convertCr(pjp, 0);
                break;
             }
          }
@@ -1797,24 +1785,24 @@ static void transformBlock(uint8 mcuBlock)
          {
             case 0:
             {
-               copyY(0);
+               copyY(pjp, 0);
                break;
             }
             case 1:
             {
-               copyY(128);
+               copyY(pjp, 128);
                break;
             }
             case 2:
             {
-               upsampleCbV(0, 0);
-               upsampleCbV(4*8, 128);
+               upsampleCbV(pjp, 0, 0);
+               upsampleCbV(pjp, 4*8, 128);
                break;
             }
             case 3:
             {
-               upsampleCrV(0, 0);
-               upsampleCrV(4*8, 128);
+               upsampleCrV(pjp, 0, 0);
+               upsampleCrV(pjp, 4*8, 128);
                break;
             }
          }
@@ -1828,24 +1816,24 @@ static void transformBlock(uint8 mcuBlock)
          {
             case 0:
             {
-               copyY(0);
+               copyY(pjp, 0);
                break;
             }
             case 1:
             {
-               copyY(64);
+               copyY(pjp, 64);
                break;
             }
             case 2:
             {
-               upsampleCbH(0, 0);
-               upsampleCbH(4, 64);
+               upsampleCbH(pjp, 0, 0);
+               upsampleCbH(pjp, 4, 64);
                break;
             }
             case 3:
             {
-               upsampleCrH(0, 0);
-               upsampleCrH(4, 64);
+               upsampleCrH(pjp, 0, 0);
+               upsampleCrH(pjp, 4, 64);
                break;
             }
          }
@@ -1859,38 +1847,38 @@ static void transformBlock(uint8 mcuBlock)
          {
             case 0:
             {
-               copyY(0);
+               copyY(pjp, 0);
                break;
             }
             case 1:
             {
-               copyY(64);
+               copyY(pjp, 64);
                break;
             }
             case 2:
             {
-               copyY(128);
+               copyY(pjp, 128);
                break;
             }
             case 3:
             {
-               copyY(192);
+               copyY(pjp, 192);
                break;
             }
             case 4:
             {
-               upsampleCb(0, 0);
-               upsampleCb(4, 64);
-               upsampleCb(4*8, 128);
-               upsampleCb(4+4*8, 192);
+               upsampleCb(pjp, 0, 0);
+               upsampleCb(pjp, 4, 64);
+               upsampleCb(pjp, 4*8, 128);
+               upsampleCb(pjp, 4+4*8, 192);
                break;
             }
             case 5:
             {
-               upsampleCr(0, 0);
-               upsampleCr(4, 64);
-               upsampleCr(4*8, 128);
-               upsampleCr(4+4*8, 192);
+               upsampleCr(pjp, 0, 0);
+               upsampleCr(pjp, 4, 64);
+               upsampleCr(pjp, 4*8, 128);
+               upsampleCr(pjp, 4+4*8, 192);
                break;
             }
          }
@@ -1900,17 +1888,17 @@ static void transformBlock(uint8 mcuBlock)
    }      
 }
 //------------------------------------------------------------------------------
-static void transformBlockReduce(uint8 mcuBlock)
+static void transformBlockReduce(PicoJpeg *pjp, uint8 mcuBlock)
 {
-   uint8 c = clamp(PJPG_DESCALE(gCoeffBuf[0]) + 128);
+   uint8 c = clamp(PJPG_DESCALE(pjp->CoeffBuf[0]) + 128);
    int16 cbG, cbB, crR, crG;
 
-   switch (gScanType)
+   switch (pjp->ScanType)
    {
       case PJPG_GRAYSCALE:
       {
          // MCU size: 1, 1 block per MCU
-         gMCUBufR[0] = c;
+         pjp->MCUBufR[0] = c;
          break;
       }
       case PJPG_YH1V1:
@@ -1920,27 +1908,27 @@ static void transformBlockReduce(uint8 mcuBlock)
          {
             case 0:
             {
-               gMCUBufR[0] = c;
-               gMCUBufG[0] = c;
-               gMCUBufB[0] = c;
+               pjp->MCUBufR[0] = c;
+               pjp->MCUBufG[0] = c;
+               pjp->MCUBufB[0] = c;
                break;
             }
             case 1:
             {
                cbG = ((c * 88U) >> 8U) - 44U;
-               gMCUBufG[0] = subAndClamp(gMCUBufG[0], cbG);
+               pjp->MCUBufG[0] = subAndClamp(pjp->MCUBufG[0], cbG);
 
                cbB = (c + ((c * 198U) >> 8U)) - 227U;
-               gMCUBufB[0] = addAndClamp(gMCUBufB[0], cbB);
+               pjp->MCUBufB[0] = addAndClamp(pjp->MCUBufB[0], cbB);
                break;
             }
             case 2:
             {
                crR = (c + ((c * 103U) >> 8U)) - 179;
-               gMCUBufR[0] = addAndClamp(gMCUBufR[0], crR);
+               pjp->MCUBufR[0] = addAndClamp(pjp->MCUBufR[0], crR);
 
                crG = ((c * 183U) >> 8U) - 91;
-               gMCUBufG[0] = subAndClamp(gMCUBufG[0], crG);
+               pjp->MCUBufG[0] = subAndClamp(pjp->MCUBufG[0], crG);
                break;
             }
          }
@@ -1954,39 +1942,39 @@ static void transformBlockReduce(uint8 mcuBlock)
          {
             case 0:
             {
-               gMCUBufR[0] = c;
-               gMCUBufG[0] = c;
-               gMCUBufB[0] = c;
+               pjp->MCUBufR[0] = c;
+               pjp->MCUBufG[0] = c;
+               pjp->MCUBufB[0] = c;
                break;
             }
             case 1:
             {
-               gMCUBufR[128] = c;
-               gMCUBufG[128] = c;
-               gMCUBufB[128] = c;
+               pjp->MCUBufR[128] = c;
+               pjp->MCUBufG[128] = c;
+               pjp->MCUBufB[128] = c;
                break;
             }
             case 2:
             {
                cbG = ((c * 88U) >> 8U) - 44U;
-               gMCUBufG[0] = subAndClamp(gMCUBufG[0], cbG);
-               gMCUBufG[128] = subAndClamp(gMCUBufG[128], cbG);
+               pjp->MCUBufG[0] = subAndClamp(pjp->MCUBufG[0], cbG);
+               pjp->MCUBufG[128] = subAndClamp(pjp->MCUBufG[128], cbG);
 
                cbB = (c + ((c * 198U) >> 8U)) - 227U;
-               gMCUBufB[0] = addAndClamp(gMCUBufB[0], cbB);
-               gMCUBufB[128] = addAndClamp(gMCUBufB[128], cbB);
+               pjp->MCUBufB[0] = addAndClamp(pjp->MCUBufB[0], cbB);
+               pjp->MCUBufB[128] = addAndClamp(pjp->MCUBufB[128], cbB);
 
                break;
             }
             case 3:
             {
                crR = (c + ((c * 103U) >> 8U)) - 179;
-               gMCUBufR[0] = addAndClamp(gMCUBufR[0], crR);
-               gMCUBufR[128] = addAndClamp(gMCUBufR[128], crR);
+               pjp->MCUBufR[0] = addAndClamp(pjp->MCUBufR[0], crR);
+               pjp->MCUBufR[128] = addAndClamp(pjp->MCUBufR[128], crR);
 
                crG = ((c * 183U) >> 8U) - 91;
-               gMCUBufG[0] = subAndClamp(gMCUBufG[0], crG);
-               gMCUBufG[128] = subAndClamp(gMCUBufG[128], crG);
+               pjp->MCUBufG[0] = subAndClamp(pjp->MCUBufG[0], crG);
+               pjp->MCUBufG[128] = subAndClamp(pjp->MCUBufG[128], crG);
 
                break;
             }
@@ -2000,39 +1988,39 @@ static void transformBlockReduce(uint8 mcuBlock)
          {
             case 0:
             {
-               gMCUBufR[0] = c;
-               gMCUBufG[0] = c;
-               gMCUBufB[0] = c;
+               pjp->MCUBufR[0] = c;
+               pjp->MCUBufG[0] = c;
+               pjp->MCUBufB[0] = c;
                break;
             }
             case 1:
             {
-               gMCUBufR[64] = c;
-               gMCUBufG[64] = c;
-               gMCUBufB[64] = c;
+               pjp->MCUBufR[64] = c;
+               pjp->MCUBufG[64] = c;
+               pjp->MCUBufB[64] = c;
                break;
             }
             case 2:
             {
                cbG = ((c * 88U) >> 8U) - 44U;
-               gMCUBufG[0] = subAndClamp(gMCUBufG[0], cbG);
-               gMCUBufG[64] = subAndClamp(gMCUBufG[64], cbG);
+               pjp->MCUBufG[0] = subAndClamp(pjp->MCUBufG[0], cbG);
+               pjp->MCUBufG[64] = subAndClamp(pjp->MCUBufG[64], cbG);
 
                cbB = (c + ((c * 198U) >> 8U)) - 227U;
-               gMCUBufB[0] = addAndClamp(gMCUBufB[0], cbB);
-               gMCUBufB[64] = addAndClamp(gMCUBufB[64], cbB);
+               pjp->MCUBufB[0] = addAndClamp(pjp->MCUBufB[0], cbB);
+               pjp->MCUBufB[64] = addAndClamp(pjp->MCUBufB[64], cbB);
 
                break;
             }
             case 3:
             {
                crR = (c + ((c * 103U) >> 8U)) - 179;
-               gMCUBufR[0] = addAndClamp(gMCUBufR[0], crR);
-               gMCUBufR[64] = addAndClamp(gMCUBufR[64], crR);
+               pjp->MCUBufR[0] = addAndClamp(pjp->MCUBufR[0], crR);
+               pjp->MCUBufR[64] = addAndClamp(pjp->MCUBufR[64], crR);
 
                crG = ((c * 183U) >> 8U) - 91;
-               gMCUBufG[0] = subAndClamp(gMCUBufG[0], crG);
-               gMCUBufG[64] = subAndClamp(gMCUBufG[64], crG);
+               pjp->MCUBufG[0] = subAndClamp(pjp->MCUBufG[0], crG);
+               pjp->MCUBufG[64] = subAndClamp(pjp->MCUBufG[64], crG);
 
                break;
             }
@@ -2046,61 +2034,61 @@ static void transformBlockReduce(uint8 mcuBlock)
          {
             case 0:
             {
-               gMCUBufR[0] = c;
-               gMCUBufG[0] = c;
-               gMCUBufB[0] = c;
+               pjp->MCUBufR[0] = c;
+               pjp->MCUBufG[0] = c;
+               pjp->MCUBufB[0] = c;
                break;
             }
             case 1:
             {
-               gMCUBufR[64] = c;
-               gMCUBufG[64] = c;
-               gMCUBufB[64] = c;
+               pjp->MCUBufR[64] = c;
+               pjp->MCUBufG[64] = c;
+               pjp->MCUBufB[64] = c;
                break;
             }
             case 2:
             {
-               gMCUBufR[128] = c;
-               gMCUBufG[128] = c;
-               gMCUBufB[128] = c;
+               pjp->MCUBufR[128] = c;
+               pjp->MCUBufG[128] = c;
+               pjp->MCUBufB[128] = c;
                break;
             }
             case 3:
             {
-               gMCUBufR[192] = c;
-               gMCUBufG[192] = c;
-               gMCUBufB[192] = c;
+               pjp->MCUBufR[192] = c;
+               pjp->MCUBufG[192] = c;
+               pjp->MCUBufB[192] = c;
                break;
             }
             case 4:
             {
                cbG = ((c * 88U) >> 8U) - 44U;
-               gMCUBufG[0] = subAndClamp(gMCUBufG[0], cbG);
-               gMCUBufG[64] = subAndClamp(gMCUBufG[64], cbG);
-               gMCUBufG[128] = subAndClamp(gMCUBufG[128], cbG);
-               gMCUBufG[192] = subAndClamp(gMCUBufG[192], cbG);
+               pjp->MCUBufG[0] = subAndClamp(pjp->MCUBufG[0], cbG);
+               pjp->MCUBufG[64] = subAndClamp(pjp->MCUBufG[64], cbG);
+               pjp->MCUBufG[128] = subAndClamp(pjp->MCUBufG[128], cbG);
+               pjp->MCUBufG[192] = subAndClamp(pjp->MCUBufG[192], cbG);
 
                cbB = (c + ((c * 198U) >> 8U)) - 227U;
-               gMCUBufB[0] = addAndClamp(gMCUBufB[0], cbB);
-               gMCUBufB[64] = addAndClamp(gMCUBufB[64], cbB);
-               gMCUBufB[128] = addAndClamp(gMCUBufB[128], cbB);
-               gMCUBufB[192] = addAndClamp(gMCUBufB[192], cbB);
+               pjp->MCUBufB[0] = addAndClamp(pjp->MCUBufB[0], cbB);
+               pjp->MCUBufB[64] = addAndClamp(pjp->MCUBufB[64], cbB);
+               pjp->MCUBufB[128] = addAndClamp(pjp->MCUBufB[128], cbB);
+               pjp->MCUBufB[192] = addAndClamp(pjp->MCUBufB[192], cbB);
 
                break;
             }
             case 5:
             {
                crR = (c + ((c * 103U) >> 8U)) - 179;
-               gMCUBufR[0] = addAndClamp(gMCUBufR[0], crR);
-               gMCUBufR[64] = addAndClamp(gMCUBufR[64], crR);
-               gMCUBufR[128] = addAndClamp(gMCUBufR[128], crR);
-               gMCUBufR[192] = addAndClamp(gMCUBufR[192], crR);
+               pjp->MCUBufR[0] = addAndClamp(pjp->MCUBufR[0], crR);
+               pjp->MCUBufR[64] = addAndClamp(pjp->MCUBufR[64], crR);
+               pjp->MCUBufR[128] = addAndClamp(pjp->MCUBufR[128], crR);
+               pjp->MCUBufR[192] = addAndClamp(pjp->MCUBufR[192], crR);
 
                crG = ((c * 183U) >> 8U) - 91;
-               gMCUBufG[0] = subAndClamp(gMCUBufG[0], crG);
-               gMCUBufG[64] = subAndClamp(gMCUBufG[64], crG);
-               gMCUBufG[128] = subAndClamp(gMCUBufG[128], crG);
-               gMCUBufG[192] = subAndClamp(gMCUBufG[192], crG);
+               pjp->MCUBufG[0] = subAndClamp(pjp->MCUBufG[0], crG);
+               pjp->MCUBufG[64] = subAndClamp(pjp->MCUBufG[64], crG);
+               pjp->MCUBufG[128] = subAndClamp(pjp->MCUBufG[128], crG);
+               pjp->MCUBufG[192] = subAndClamp(pjp->MCUBufG[192], crG);
 
                break;
             }
@@ -2110,56 +2098,60 @@ static void transformBlockReduce(uint8 mcuBlock)
    }
 }
 //------------------------------------------------------------------------------
-static uint8 decodeNextMCU(void)
+static uint8 decodeNextMCU(PicoJpeg *pjp)
 {
    uint8 status;
    uint8 mcuBlock;   
 
-   if (gRestartInterval) 
+   if (pjp->RestartInterval) 
    {
-      if (gRestartsLeft == 0)
+      if (pjp->RestartsLeft == 0)
       {
-         status = processRestart();
+         status = processRestart(pjp);
          if (status)
             return status;
       }
-      gRestartsLeft--;
+      pjp->RestartsLeft--;
    }      
    
-   for (mcuBlock = 0; mcuBlock < gMaxBlocksPerMCU; mcuBlock++)
+   for (mcuBlock = 0; mcuBlock < pjp->MaxBlocksPerMCU; mcuBlock++)
    {
-      uint8 componentID = gMCUOrg[mcuBlock];
-      uint8 compQuant = gCompQuant[componentID];	
-      uint8 compDCTab = gCompDCTab[componentID];
+      uint8 componentID = pjp->MCUOrg[mcuBlock];
+      uint8 compQuant = pjp->CompQuant[componentID];	
+      uint8 compDCTab = pjp->CompDCTab[componentID];
       uint8 numExtraBits, compACTab, k;
-      const int16* pQ = compQuant ? gQuant1 : gQuant0;
+      const int16* pQ = compQuant ? pjp->Quant1 : pjp->Quant0;
       uint16 r, dc;
 
-      uint8 s = huffDecode(compDCTab ? &gHuffTab1 : &gHuffTab0, compDCTab ? gHuffVal1 : gHuffVal0);
+      uint8 s = huffDecode(pjp, compDCTab ? &pjp->HuffTab1 : &pjp->HuffTab0,
+              compDCTab ? pjp->HuffVal1 : pjp->HuffVal0);
       
       r = 0;
       numExtraBits = s & 0xF;
       if (numExtraBits)
-         r = getBits2(numExtraBits);
+         r = getBits2(pjp, numExtraBits);
       dc = huffExtend(r, s);
             
-      dc = dc + gLastDC[componentID];
-      gLastDC[componentID] = dc;
+      dc = dc + pjp->LastDC[componentID];
+      pjp->LastDC[componentID] = dc;
             
-      gCoeffBuf[0] = dc * pQ[0];
+      pjp->CoeffBuf[0] = dc * pQ[0];
 
-      compACTab = gCompACTab[componentID];
+      compACTab = pjp->CompACTab[componentID];
 
-      if (gReduce)
+      if (pjp->output_type == PJPG_REDUCED_GRAY8 ||
+          pjp->output_type == PJPG_REDUCED_RGB888 ||
+          pjp->output_type == PJPG_REDUCED_RGB565)
       {
          // Decode, but throw out the AC coefficients in reduce mode.
          for (k = 1; k < 64; k++)
          {
-            s = huffDecode(compACTab ? &gHuffTab3 : &gHuffTab2, compACTab ? gHuffVal3 : gHuffVal2);
+            s = huffDecode(pjp, compACTab ? &pjp->HuffTab3 : &pjp->HuffTab2,
+                    compACTab ? pjp->HuffVal3 : pjp->HuffVal2);
 
             numExtraBits = s & 0xF;
             if (numExtraBits)
-               getBits2(numExtraBits);
+               getBits2(pjp, numExtraBits);
 
             r = s >> 4;
             s &= 15;
@@ -2188,7 +2180,7 @@ static uint8 decodeNextMCU(void)
             }
          }
 
-         transformBlockReduce(mcuBlock); 
+         transformBlockReduce(pjp, mcuBlock); 
       }
       else
       {
@@ -2197,12 +2189,13 @@ static uint8 decodeNextMCU(void)
          {
             uint16 extraBits;
 
-            s = huffDecode(compACTab ? &gHuffTab3 : &gHuffTab2, compACTab ? gHuffVal3 : gHuffVal2);
+            s = huffDecode(pjp, compACTab ? &pjp->HuffTab3 : &pjp->HuffTab2,
+                    compACTab ? pjp->HuffVal3 : pjp->HuffVal2);
 
             extraBits = 0;
             numExtraBits = s & 0xF;
             if (numExtraBits)
-               extraBits = getBits2(numExtraBits);
+               extraBits = getBits2(pjp, numExtraBits);
 
             r = s >> 4;
             s &= 15;
@@ -2218,14 +2211,14 @@ static uint8 decodeNextMCU(void)
 
                   while (r)
                   {
-                     gCoeffBuf[ZAG[k++]] = 0;
+                     pjp->CoeffBuf[ZAG[k++]] = 0;
                      r--;
                   }
                }
 
                ac = huffExtend(extraBits, s);
                
-               gCoeffBuf[ZAG[k]] = ac * pQ[k]; 
+               pjp->CoeffBuf[ZAG[k]] = ac * pQ[k]; 
             }
             else
             {
@@ -2235,7 +2228,7 @@ static uint8 decodeNextMCU(void)
                      return PJPG_DECODE_ERROR;
                   
                   for (r = 16; r > 0; r--)
-                     gCoeffBuf[ZAG[k++]] = 0;
+                     pjp->CoeffBuf[ZAG[k++]] = 0;
                   
                   k--; // - 1 because the loop counter is k
                }
@@ -2245,70 +2238,196 @@ static uint8 decodeNextMCU(void)
          }
          
          while (k < 64)
-            gCoeffBuf[ZAG[k++]] = 0;
+            pjp->CoeffBuf[ZAG[k++]] = 0;
 
-         transformBlock(mcuBlock); 
+         transformBlock(pjp, mcuBlock); 
       }
    }
-         
    return 0;
 }
 //------------------------------------------------------------------------------
-unsigned char pjpeg_decode_mcu(void)
+unsigned char pjpeg_decode_mcu(pjpeg_image_info_t *pInfo)
 {
    uint8 status;
+   PicoJpeg *pjp = pInfo->m_PJHandle;
+   if (pjp->CallbackStatus)
+      return pjp->CallbackStatus;
    
-   if (gCallbackStatus)
-      return gCallbackStatus;
-   
-   if (!gNumMCUSRemaining)
+   if (!pjp->NumMCUSRemaining)
       return PJPG_NO_MORE_BLOCKS;
       
-   status = decodeNextMCU();
-   if ((status) || (gCallbackStatus))
-      return gCallbackStatus ? gCallbackStatus : status;
+   status = decodeNextMCU(pjp);
+   if ((status) || (pjp->CallbackStatus))
+      return pjp->CallbackStatus ? pjp->CallbackStatus : status;
       
-   gNumMCUSRemaining--;
+   pjp->NumMCUSRemaining--;
    
    return 0;
 }
+
 //------------------------------------------------------------------------------
-unsigned char pjpeg_decode_init(pjpeg_image_info_t *pInfo, pjpeg_need_bytes_callback_t pNeed_bytes_callback, void *pCallback_data, unsigned char reduce)
+unsigned char pjpeg_decode_init(pjpeg_image_info_t *pInfo, jsread_t *jsread, void *pCallback_data, void *storage, pjpeg_output_type_t output_type)
 {
    uint8 status;
-   
-   pInfo->m_width = 0; pInfo->m_height = 0; pInfo->m_comps = 0;
-   pInfo->m_MCUSPerRow = 0; pInfo->m_MCUSPerCol = 0;
+   uint8 *p;
+   uint8 *e;
+   PicoJpeg *pjp;
+   if (storage == 0) {
+       return PJPG_NOTENOUGHMEM;
+   }
+   pjp = storage;
+   /* Clear storage block.  Could use memset, but we are avoiding using libraries. */
+   for (p = (uint8 *)pjp, e = p + sizeof(PicoJpeg); p < e; p++) {
+      *p = 0;
+   }
+   /* Clear Info block.  Could use memset, but we are avoiding using libraries. */
+   for (p = (uint8 *)pInfo, e = p + sizeof(pjpeg_image_info_t); p < e; p++) {
+      *p = 0;
+   }
    pInfo->m_scanType = PJPG_GRAYSCALE;
-   pInfo->m_MCUWidth = 0; pInfo->m_MCUHeight = 0;
-   pInfo->m_pMCUBufR = (unsigned char*)0; pInfo->m_pMCUBufG = (unsigned char*)0; pInfo->m_pMCUBufB = (unsigned char*)0;
 
-   g_pNeedBytesCallback = pNeed_bytes_callback;
-   g_pCallback_data = pCallback_data;
-   gCallbackStatus = 0;
-   gReduce = reduce;
+   pjp->Jsread = jsread;
+   pjp->pCallback_data = pCallback_data;
+   pjp->CallbackStatus = 0;
+   pjp->output_type = output_type;
     
-   status = init();
-   if ((status) || (gCallbackStatus))
-      return gCallbackStatus ? gCallbackStatus : status;
-   
-   status = locateSOFMarker();
-   if ((status) || (gCallbackStatus))
-      return gCallbackStatus ? gCallbackStatus : status;
+   pjp->BitsLeft = 8;
+   getBits1(pjp, 8);
+   getBits1(pjp, 8);
+   status = locateSOFMarker(pjp);
+   if ((status) || (pjp->CallbackStatus))
+      return pjp->CallbackStatus ? pjp->CallbackStatus : status;
 
-   status = initFrame();
-   if ((status) || (gCallbackStatus))
-      return gCallbackStatus ? gCallbackStatus : status;
+   status = initFrame(pjp);
+   if ((status) || (pjp->CallbackStatus))
+      return pjp->CallbackStatus ? pjp->CallbackStatus : status;
 
-   status = initScan();
-   if ((status) || (gCallbackStatus))
-      return gCallbackStatus ? gCallbackStatus : status;
+   status = initScan(pjp);
+   if ((status) || (pjp->CallbackStatus))
+      return pjp->CallbackStatus ? pjp->CallbackStatus : status;
 
-   pInfo->m_width = gImageXSize; pInfo->m_height = gImageYSize; pInfo->m_comps = gCompsInFrame;
-   pInfo->m_scanType = gScanType;
-   pInfo->m_MCUSPerRow = gMaxMCUSPerRow; pInfo->m_MCUSPerCol = gMaxMCUSPerCol;
-   pInfo->m_MCUWidth = gMaxMCUXSize; pInfo->m_MCUHeight = gMaxMCUYSize;
-   pInfo->m_pMCUBufR = gMCUBufR; pInfo->m_pMCUBufG = gMCUBufG; pInfo->m_pMCUBufB = gMCUBufB;
-      
+   pInfo->m_width = pjp->ImageXSize;
+   pInfo->m_height = pjp->ImageYSize;
+   pInfo->m_comps = pjp->CompsInFrame;
+   pInfo->m_scanType = pjp->ScanType;
+   pInfo->m_MCUSPerRow = pjp->MaxMCUSPerRow;
+   pInfo->m_MCUSPerCol = pjp->MaxMCUSPerCol;
+   pInfo->m_MCUWidth = pjp->MaxMCUXSize;
+   pInfo->m_MCUHeight = pjp->MaxMCUYSize;
+   pInfo->m_pMCUBufR = pjp->MCUBufR;
+   pInfo->m_pMCUBufG = pjp->MCUBufG;
+   pInfo->m_pMCUBufB = pjp->MCUBufB;
+   pInfo->m_outputType = pjp->output_type;
+   pInfo->m_PJHandle = pjp;
+
    return 0;
+
 }
+
+//------------------------------------------------------------------------------
+// Streams JPEG image decoded from initialized info structure. Returns NULL on failure.
+unsigned char pjpeg_decode_scanlines(pjpeg_image_info_t *pInfo, jswrite_t *jswrite, void *pCallback_data)
+{
+    int mcu_x;
+    int mcu_y;
+    uint8 *pPixCur;
+    uint8 *pSrcR;
+    uint8 *pSrcG;
+    uint8 *pSrcB;
+    uint8 status;
+    int y, x;
+    unsigned int pixsize;
+
+    switch(pInfo->m_outputType) {
+        case PJPG_GRAY8:
+        case PJPG_REDUCED_GRAY8:
+            pixsize = 1;
+            break;
+        case PJPG_RGB565:
+        case PJPG_REDUCED_RGB565:
+            pixsize = 2;
+            break;
+        case PJPG_RGB888:
+        case PJPG_REDUCED_RGB888:
+            pixsize = 3;
+            break;
+        default:
+            return PJPG_UNSUPPORTED_COLORSPACE;
+    }
+    if (pInfo->m_linebuf == 0) {
+        return PJPG_NOTENOUGHMEM;
+    }
+    for (mcu_y = 0; mcu_y < pInfo->m_MCUSPerCol; ++mcu_y) {
+        pPixCur = pInfo->m_linebuf;
+        for (mcu_x = 0; mcu_x < pInfo->m_MCUSPerRow; ++mcu_x) {
+            if ((status = pjpeg_decode_mcu(pInfo)) != PJPG_OK) {
+               return status;
+            }
+            pSrcR = pInfo->m_pMCUBufR;
+            pSrcG = pInfo->m_pMCUBufG;
+            pSrcB = pInfo->m_pMCUBufB;
+            for (y = 0; y < pInfo->m_MCUHeight; ++y) {
+                for (x = 0; x < pInfo->m_MCUWidth; ++x) {
+                    switch(pInfo->m_outputType) {
+                        case PJPG_GRAY8:
+                        case PJPG_REDUCED_GRAY8:
+                            *pPixCur++ = *pSrcR++;
+                            break;
+                        case PJPG_RGB565:
+                        case PJPG_REDUCED_RGB565:
+                            #if RGB565_LITTLE_ENDIAN
+                            *pPixCur++ = (uint8)(((*pSrcG << 3) & 0xE0) | ((*pSrcB++ >> 3) & 0x1F));
+                            *pPixCur++ = (uint8)((*pSrcR++ & 0xF8) | ((*pSrcG++ >> 5) & 0x07));
+                            #else
+                            *pPixCur++ = (uint8)((*pSrcR++ & 0xF8) | ((*pSrcG >> 5) & 0x07));
+                            *pPixCur++ = (uint8)(((*pSrcG++ << 3) & 0xE0) | ((*pSrcB++ >> 3) & 0x1F));
+                            #endif
+                            break;
+                        case PJPG_RGB888:
+                        case PJPG_REDUCED_RGB888:
+                        default:
+                            *pPixCur++ = *pSrcR++;
+                            *pPixCur++ = *pSrcG++;
+                            *pPixCur++ = *pSrcB++;
+                            break;
+                    }
+                }
+                pPixCur += (pInfo->m_width - pInfo->m_MCUWidth)*pixsize;
+            }
+            pPixCur -= (pInfo->m_width*pInfo->m_MCUHeight - pInfo->m_MCUWidth)*pixsize;
+        }
+        pPixCur = pInfo->m_linebuf;
+        for (y = 0; y < pInfo->m_MCUHeight; ++y) {
+            (*jswrite)(pPixCur, pInfo->m_width*pixsize, pCallback_data);
+            pPixCur += pInfo->m_width*pixsize;
+        }
+    }
+   return PJPG_OK;
+}
+
+//------------------------------------------------------------------------------
+unsigned int pjpeg_get_storage_size(void) {
+    return (unsigned int)sizeof(PicoJpeg);
+}
+
+//------------------------------------------------------------------------------
+unsigned int pjpeg_get_line_buffer_size(pjpeg_image_info_t *pInfo) {
+    unsigned int pixsize;
+    switch(pInfo->m_outputType) {
+        case PJPG_GRAY8:
+        case PJPG_REDUCED_GRAY8:
+            pixsize = 1;
+            break;
+        case PJPG_RGB565:
+        case PJPG_REDUCED_RGB565:
+            pixsize = 2;
+            break;
+        case PJPG_RGB888:
+        case PJPG_REDUCED_RGB888:
+        default:
+            pixsize = 3;
+            break;
+    }
+    return (unsigned int)(pInfo->m_width*pInfo->m_MCUHeight*pixsize);
+}
+
