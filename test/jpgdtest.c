@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 #define RGB565TEST
 #ifdef RGB565TEST
 #define OUTPUT_TYPE PJPG_RGB565
@@ -60,7 +61,7 @@ static const uint8 BmpHdr[] = {
 
 static int print_usage()
 {
-   printf("Usage: jpgdtest [source_file] <[dest_file]>\n");
+   printf("Usage: jpgdtest <-h [height]> <-w [width]> <-x [x_offset]> <-y [y_offset]> [source_file] <[dest_file]>\n");
    printf("source_file: JPEG file to decode. Note: Progressive files are not supported.\n");
    printf("dest_file: Output .bmp file\n");
    printf("\n");
@@ -92,6 +93,11 @@ int main(int argc, char *argv[])
    uint8 status;
    FILE *f;
    FILE *pfIn;
+   int c;
+   int height = 0;
+   int width = 0;
+   int xoffs = -1;
+   int yoffs = -1;
    pjpeg_image_info_t image_info;
    void *storage;
    unsigned int linebuf_size;
@@ -100,11 +106,27 @@ int main(int argc, char *argv[])
    uint8 hdr[sizeof(BmpHdr)];
    struct str_callback_data cb;
    
-   if (argc < 2) {
+   while ((c = getopt(argc, argv, "h:w:x:y:")) != -1) {
+      switch (c) {
+      case 'h':
+         height = atol(optarg);
+         break;
+      case 'w':
+         width = atol(optarg);
+         break;
+      case 'x':
+         xoffs = atol(optarg);
+         break;
+      case 'y':
+         yoffs = atol(optarg);
+         break;
+      }
+   }
+   if (argc - optind == 0) {
       return print_usage();
    }
 
-   if ((pfIn = fopen(argv[1], "rb")) == NULL) {
+   if ((pfIn = fopen(argv[optind], "rb")) == NULL) {
       printf("Failed opening source image %s\n", argv[2]);
       print_usage();
       return EXIT_FAILURE;
@@ -122,7 +144,14 @@ int main(int argc, char *argv[])
 
       return EXIT_FAILURE;
    }
-   
+
+   if (height <= 0) {
+      height = image_info.m_height;
+   }
+   if (width <= 0) {
+      width = image_info.m_width;
+   }
+   pjpeg_set_window(&image_info, width, height, xoffs, yoffs);
    linebuf_size = pjpeg_get_line_buffer_size(&image_info);
    cb.line_size = (int)linebuf_size/(int)image_info.m_MCUHeight;
    image_size = cb.line_size*image_info.m_height;
@@ -134,7 +163,7 @@ int main(int argc, char *argv[])
 
    printf("Memory allocation: %u for internal decoder, %u for linebuf\n",
          pjpeg_get_storage_size(), linebuf_size);
-   f = fopen((argc > 2) ? argv[2] : "picojpeg_out.bmp", "wb");
+   f = fopen((argc - optind > 1) ? argv[optind+1] : "picojpeg_out.bmp", "wb");
    if (!f) {
       printf("Error opening the output file.\n");
       return 1;

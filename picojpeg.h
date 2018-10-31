@@ -137,11 +137,24 @@ typedef int (jswrite_t)(void *buffer, int size, void *pCallback_data);
 
 // Initializes the decompressor. Returns 0 on success, or one of the above error codes on failure.
 // jsread will be called to fill the decompressor's internal input buffer.
-// If reduced output type, only the first pixel pjpeg_output_type_t output_typeof each block will be decoded. This mode is much faster because it skips the AC dequantization, IDCT and chroma upsampling of every image pixel.
+// If reduced output type, only the first pixel pjpeg_output_type_t output_typeof each block will
+// be decoded. This mode is much faster because it skips the AC dequantization, IDCT and chroma
+// upsampling of every image pixel.
 // If RGB565 output type, data format is 2 bytes: |RRRRRGGG|GGGBBBBB|
-unsigned char pjpeg_decode_init(pjpeg_image_info_t *pInfo, jsread_t *jsread, void *pCallback_data, void *storage, pjpeg_output_type_t output_type);
+unsigned char pjpeg_decode_init(pjpeg_image_info_t *pInfo, jsread_t *jsread, void *pCallback_data,
+      void *storage, pjpeg_output_type_t output_type);
 
-// Decompresses the file's next MCU. Returns 0 on success, PJPG_NO_MORE_BLOCKS if no more blocks are available, or an error code.
+// Specify window of input image to decompress.  If the window size is greater than the image size,
+// then the image will decompressed to the center of the window, and bordered in black.  If the window
+// size is less than the image size, then the image will be cropped to fit into the window.  If upper
+// or left corner offset parameter is negative, then the image in that direction will be cropped from
+// the center.
+// This method must be called after pjpeg_decode_init() and before decoding begins.
+unsigned char pjpeg_set_window(pjpeg_image_info_t *pInfo, unsigned int width_pixels,
+      unsigned int height_pixels, int left_offset_pixels, int top_offset_pixels);
+
+// Decompresses the file's next MCU. Returns 0 on success, PJPG_NO_MORE_BLOCKS if no more blocks
+// are available, or an error code.
 // Must be called a total of m_MCUSPerRow*m_MCUSPerCol times to completely decompress the image.
 unsigned char pjpeg_decode_mcu(pjpeg_image_info_t *pInfo);
 

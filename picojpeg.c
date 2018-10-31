@@ -17,7 +17,9 @@
 #define PJPG_INLINE
 
 // Set RGB565_LITTLE_ENDIAN to 1 for little-endian byte order in RGB565 uint16 pixels
+#if !defined RGB565_LITTLE_ENDIAN
 #define RGB565_LITTLE_ENDIAN 1
+#endif
 
 //------------------------------------------------------------------------------
 typedef unsigned char   uint8;
@@ -201,6 +203,10 @@ typedef struct PicoJpegT {
     void *pCallback_data;
     uint8 CallbackStatus;
     uint8 output_type;
+    uint16 ImageXWindow;
+    uint16 ImageYWindow;
+    uint16 ImageXOffset;
+    uint16 ImageYOffset;
     uint8 InBuf[PJPG_MAX_IN_BUF_SIZE];
 } PicoJpeg;
 
@@ -606,11 +612,15 @@ static uint8 readSOFMarker(PicoJpeg *pjp)
 
    if ((!pjp->ImageYSize) || (pjp->ImageYSize > PJPG_MAX_HEIGHT))
       return PJPG_BAD_HEIGHT;
+   pjp->ImageYWindow = pjp->ImageYSize;
+   pjp->ImageYOffset = 0;
 
    pjp->ImageXSize = getBits1(pjp, 16);
 
    if ((!pjp->ImageXSize) || (pjp->ImageXSize > PJPG_MAX_WIDTH))
       return PJPG_BAD_WIDTH;
+   pjp->ImageXWindow = pjp->ImageXSize;
+   pjp->ImageXOffset = 0;
 
    pjp->CompsInFrame = (uint8)getBits1(pjp, 8);
 
@@ -2330,13 +2340,17 @@ unsigned char pjpeg_decode_scanlines(pjpeg_image_info_t *pInfo, jswrite_t *jswri
 {
     int mcu_x;
     int mcu_y;
+    int xcur;
+    int preinsert;
     uint8 *pPixCur;
+    uint8 *pPixStart;
     uint8 *pSrcR;
     uint8 *pSrcG;
     uint8 *pSrcB;
     uint8 status;
     int y, x;
     unsigned int pixsize;
+    PicoJpeg *pjp = (PicoJpeg *)pInfo->m_PJHandle;
 
     switch(pInfo->m_outputType) {
         case PJPG_GRAY8:
@@ -2357,17 +2371,53 @@ unsigned char pjpeg_decode_scanlines(pjpeg_image_info_t *pInfo, jswrite_t *jswri
     if (pInfo->m_linebuf == 0) {
         return PJPG_NOTENOUGHMEM;
     }
+    // If our decompress window is bigger than the image and this is the first
+    // decode call, insert needed blank lines
+    if (pjp->ImageYWindow > pjp->ImageYSize &&
+            pjp->NumMCUSRemaining == pjp->MaxMCUSPerRow * pjp->MaxMCUSPerCol) {
+        uint8 *p = (uint8 *)pInfo->m_linebuf;
+        uint8 *e = p + pjpeg_get_line_buffer_size(pInfo);
+        uint16 u = (pjp->ImageYWindow - pjp->ImageYSize)/2;
+        pjp->ImageYWindow -= u;
+        /* Clear line buffer.  Could use memset, but we are avoiding using libraries. */
+        while (p < e) {
+            *p++ = 0;
+        }
+        /* Write our blank leading lines */
+        while (u-- > 0) {
+            (*jswrite)(pInfo->m_linebuf, pInfo->m_width*pixsize, pCallback_data);
+        }
+    }
+    preinsert = (pjp->ImageXWindow > pjp->ImageXSize) ?
+            ((pjp->ImageXWindow - pjp->ImageXSize)/2)*pixsize : 0;
     for (mcu_y = 0; mcu_y < pInfo->m_MCUSPerCol; ++mcu_y) {
-        pPixCur = pInfo->m_linebuf;
         for (mcu_x = 0; mcu_x < pInfo->m_MCUSPerRow; ++mcu_x) {
             if ((status = pjpeg_decode_mcu(pInfo)) != PJPG_OK) {
                return status;
             }
+            pPixStart = pInfo->m_linebuf + (mcu_x*pInfo->m_MCUWidth - pjp->ImageXOffset)*pixsize;
+            xcur = mcu_x*pInfo->m_MCUWidth;
             pSrcR = pInfo->m_pMCUBufR;
             pSrcG = pInfo->m_pMCUBufG;
             pSrcB = pInfo->m_pMCUBufB;
             for (y = 0; y < pInfo->m_MCUHeight; ++y) {
+                pPixCur = pPixStart + y*pInfo->m_width*pixsize;
+                // If we have to insert pixels before image
+                if (mcu_x == 0 && preinsert > 0) {
+                    int u;
+                    for (u = 0; u < preinsert; u++) {
+                        *(pPixCur + u) = 0;
+                    }
+                }
+                pPixCur += preinsert;
                 for (x = 0; x < pInfo->m_MCUWidth; ++x) {
+                    if ((xcur + x < pjp->ImageXOffset) || // Pixel is outside window
+                            (xcur + x >= pjp->ImageXOffset + pjp->ImageXWindow)) {
+                        pSrcR++;
+                        pSrcG++;
+                        pSrcB++;
+                        continue;
+                    }
                     switch(pInfo->m_outputType) {
                         case PJPG_GRAY8:
                         case PJPG_REDUCED_GRAY8:
@@ -2392,14 +2442,44 @@ unsigned char pjpeg_decode_scanlines(pjpeg_image_info_t *pInfo, jswrite_t *jswri
                             break;
                     }
                 }
-                pPixCur += (pInfo->m_width - pInfo->m_MCUWidth)*pixsize;
+                // If we have to insert pixels after image
+                if (mcu_x == pInfo->m_MCUSPerRow - 1 && preinsert > 0) {
+                    int u;
+                    for (u = 0; u < preinsert; u++) {
+                        *pPixCur++ = 0;
+                    }
+                    // Add an extra pixel at the end if an odd number of padding pixels
+                    if (((pjp->ImageXWindow - pjp->ImageXSize) & 1) != 0) {
+                        for (u = 0; u < pixsize; u++) {
+                            *pPixCur++ = 0;
+                        }
+                    }
+                }
             }
-            pPixCur -= (pInfo->m_width*pInfo->m_MCUHeight - pInfo->m_MCUWidth)*pixsize;
         }
         pPixCur = pInfo->m_linebuf;
         for (y = 0; y < pInfo->m_MCUHeight; ++y) {
-            (*jswrite)(pPixCur, pInfo->m_width*pixsize, pCallback_data);
-            pPixCur += pInfo->m_width*pixsize;
+            if (pjp->ImageYOffset > 0) {  // We need to crop, so discard this line
+                --pjp->ImageYOffset;
+            } else if (pjp->ImageYWindow > 0) {
+                (*jswrite)(pPixCur, pInfo->m_width*pixsize, pCallback_data);
+                pPixCur += pInfo->m_width*pixsize;
+                --pjp->ImageYWindow;
+            }
+        }
+        // If our decompress window is bigger than the image and this is the last
+        // decode call, insert needed blank lines
+        if (pjp->NumMCUSRemaining == 0 && pjp->ImageYWindow > 0) {
+            uint8 *p = (uint8 *)pInfo->m_linebuf;
+            uint8 *e = p + pjpeg_get_line_buffer_size(pInfo);
+            /* Clear line buffer.  Could use memset, but we are avoiding using libraries. */
+            while (p < e) {
+                *p++ = 0;
+            }
+            /* Write our blank trailing lines */
+            while (pjp->ImageYWindow-- > 0) {
+                (*jswrite)(pInfo->m_linebuf, pInfo->m_width*pixsize, pCallback_data);
+            }
         }
     }
    return PJPG_OK;
@@ -2429,5 +2509,37 @@ unsigned int pjpeg_get_line_buffer_size(pjpeg_image_info_t *pInfo) {
             break;
     }
     return (unsigned int)(pInfo->m_width*pInfo->m_MCUHeight*pixsize);
+}
+
+//------------------------------------------------------------------------------
+unsigned char pjpeg_set_window(pjpeg_image_info_t *pInfo, unsigned int width_pixels,
+      unsigned int height_pixels, int left_offset_pixels, int top_offset_pixels) {
+   PicoJpeg *pjp;
+   if (pInfo == 0 || (pjp = pInfo->m_PJHandle) == 0 || pjp->ImageXSize == 0 || pjp->ImageYSize == 0) {
+      return(PJPG_NOT_JPEG);
+   }
+   if ((uint16)width_pixels < pjp->ImageXSize) {
+      if (left_offset_pixels < 0 || (uint16)left_offset_pixels > pjp->ImageXSize - (uint16)width_pixels) {
+         pjp->ImageXOffset = (pjp->ImageXSize - (uint16)width_pixels)/2;
+      } else {
+         pjp->ImageXOffset = (uint16)left_offset_pixels;
+      }
+   } else {
+      pjp->ImageXOffset = 0;
+   }
+   pjp->ImageXWindow = (uint16)width_pixels;
+   pInfo->m_width = pjp->ImageXWindow;
+   if ((uint16)height_pixels < pjp->ImageYSize) {
+      if (top_offset_pixels < 0 || (uint16)top_offset_pixels > pjp->ImageYSize - (uint16)height_pixels) {
+         pjp->ImageYOffset = (pjp->ImageYSize - (uint16)height_pixels)/2;
+      } else {
+         pjp->ImageYOffset = (uint16)top_offset_pixels;
+      }
+   } else {
+      pjp->ImageYOffset = 0;
+   }
+   pjp->ImageYWindow = (uint16)height_pixels;
+   pInfo->m_height = pjp->ImageYWindow;
+   return PJPG_OK;
 }
 
