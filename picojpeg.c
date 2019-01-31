@@ -619,7 +619,7 @@ static uint8 readSOFMarker(PicoJpeg *pjp)
 
    if ((!pjp->ImageXSize) || (pjp->ImageXSize > PJPG_MAX_WIDTH))
       return PJPG_BAD_WIDTH;
-   pjp->ImageXWindow = pjp->ImageXSize;
+   pjp->ImageXWindow = pjp->ImageXSize & (uint16)(~1);
    pjp->ImageXOffset = 0;
 
    pjp->CompsInFrame = (uint8)getBits1(pjp, 8);
@@ -2518,6 +2518,7 @@ unsigned char pjpeg_set_window(pjpeg_image_info_t *pInfo, unsigned int width_pix
    if (pInfo == 0 || (pjp = pInfo->m_PJHandle) == 0 || pjp->ImageXSize == 0 || pjp->ImageYSize == 0) {
       return(PJPG_NOT_JPEG);
    }
+   width_pixels &= ~1U;
    if ((uint16)width_pixels < pjp->ImageXSize) {
       if (left_offset_pixels < 0 || (uint16)left_offset_pixels > pjp->ImageXSize - (uint16)width_pixels) {
          pjp->ImageXOffset = (pjp->ImageXSize - (uint16)width_pixels)/2;
